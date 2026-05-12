@@ -87,6 +87,16 @@ def api_stats():
             "SELECT exit_time, pnl, side FROM positions WHERE status='closed' ORDER BY exit_time DESC"
         ).fetchall()
 
+        conviction_rows = conn.execute(
+            """SELECT
+                low_conviction,
+                COUNT(*) as trades,
+                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                ROUND(SUM(pnl), 2) as pnl
+               FROM positions WHERE status='closed'
+               GROUP BY low_conviction"""
+        ).fetchall()
+
         daily_pnl_row = conn.execute(
             "SELECT COALESCE(SUM(pnl),0) as total FROM positions WHERE status='closed' AND exit_time >= ? AND exit_time < ?",
             (start_utc, end_utc),
@@ -138,6 +148,21 @@ def api_stats():
         d["pnl"] = round(d["pnl"], 2)
         d["win_rate"] = round(d["wins"] / d["trades"] * 100, 1) if d["trades"] else 0.0
 
+    # Conviction comparison
+    conviction_comparison = {"high": None, "low": None}
+    for row in conviction_rows:
+        r = dict(row)
+        trades = r["trades"]
+        wins = r["wins"]
+        key = "low" if r["low_conviction"] else "high"
+        conviction_comparison[key] = {
+            "trades": trades,
+            "wins": wins,
+            "losses": trades - wins,
+            "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
+            "pnl": round(r["pnl"] or 0, 2),
+        }
+
     return jsonify(
         btc_price=btc,
         daily_pnl=daily_pnl,
@@ -151,6 +176,7 @@ def api_stats():
         all_closed=all_closed_list,
         pnl_curve=pnl_curve,
         daily_breakdown=daily_breakdown,
+        conviction_comparison=conviction_comparison,
         server_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     )
 
@@ -449,6 +475,13 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <div class="section">
+    <div class="section-header">Conviction Filter Comparison (All Time)</div>
+    <div id="conviction-body">
+      <div class="empty">No data yet.</div>
+    </div>
+  </div>
+
+  <div class="section">
     <div class="section-header">P&amp;L by Day (PST)</div>
     <div id="daily-breakdown-body">
       <div class="empty">No completed days yet.</div>
@@ -587,6 +620,34 @@ function renderChart(curve) {
   });
 }
 
+function renderConviction(c) {
+  const el = document.getElementById('conviction-body');
+  if (!c || (!c.high && !c.low)) {
+    el.innerHTML = '<div class="empty">No data yet — trades will appear here once closed.</div>';
+    return;
+  }
+  let html = '<table><thead><tr>'
+    + '<th>Type</th><th>Trades</th><th>Win Rate</th><th>P&amp;L</th>'
+    + '</tr></thead><tbody>';
+  const rows = [
+    { label: 'High Conviction (< 0.46 or > 0.54)', data: c.high, color: 'var(--green)' },
+    { label: 'Low Conviction (0.46 – 0.54)',        data: c.low,  color: 'var(--yellow)' },
+  ];
+  for (const { label, data, color } of rows) {
+    if (!data) continue;
+    const pnlClass = data.pnl > 0 ? 'positive' : data.pnl < 0 ? 'negative' : 'neutral';
+    const wrClass  = data.win_rate >= 55 ? 'positive' : data.win_rate >= 50 ? 'neutral' : 'negative';
+    html += `<tr>
+      <td style="color:${color};font-weight:600">${label}</td>
+      <td>${data.trades}</td>
+      <td class="${wrClass}">${data.win_rate}%&nbsp;<span style="color:var(--muted);font-weight:400">(${data.wins}W / ${data.losses}L)</span></td>
+      <td class="${pnlClass}">${data.pnl >= 0 ? '+' : ''}$${data.pnl.toFixed(2)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
 function renderDailyBreakdown(days) {
   const el = document.getElementById('daily-breakdown-body');
   if (!days || !days.length) {
@@ -662,6 +723,7 @@ async function refresh() {
     renderOpen(d.open_positions);
     renderClosed(d.closed_today);
     renderChart(d.pnl_curve);
+    renderConviction(d.conviction_comparison);
     renderDailyBreakdown(d.daily_breakdown);
   } catch(e) {
     console.error('refresh error', e);
