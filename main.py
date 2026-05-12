@@ -309,6 +309,13 @@ def run_bot() -> None:
                             f"Token price {entry_price:.4f} > MAX_ENTRY_PRICE {config.MAX_ENTRY_PRICE} — skipping"
                         )
                         continue
+
+                    if config.CONVICTION_SKIP_LOW <= entry_price <= config.CONVICTION_SKIP_HIGH:
+                        logger.debug(
+                            f"Token price {entry_price:.4f} in no-conviction zone "
+                            f"({config.CONVICTION_SKIP_LOW}-{config.CONVICTION_SKIP_HIGH}) — skipping"
+                        )
+                        continue
                     order = polymarket.place_order(mid, token_id, side, position_size, entry_price)
                     if order:
                         database.insert_position(mid, side, entry_price, position_size,
