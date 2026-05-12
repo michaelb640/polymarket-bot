@@ -1,0 +1,21 @@
+# Credentials — never commit these
+.env
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Logs and runtime files
+logs/
+*.log
+bot.pid
+
+# macOS
+.DS_Store
