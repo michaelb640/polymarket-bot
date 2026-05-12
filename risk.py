@@ -38,7 +38,7 @@ def reset_daily_counters() -> None:
     logger.info("Daily risk counters reset.")
 
 
-_DAILY_LOSS_LIMIT_PCT = 0.15  # stop trading if daily loss exceeds 15% of account balance
+_DAILY_LOSS_LIMIT_PCT = config.DAILY_LOSS_LIMIT_PCT
 
 
 def can_open_position(market_id: str) -> bool:
