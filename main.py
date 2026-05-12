@@ -310,17 +310,16 @@ def run_bot() -> None:
                         )
                         continue
 
-                    if config.CONVICTION_SKIP_LOW <= entry_price <= config.CONVICTION_SKIP_HIGH:
-                        logger.debug(
-                            f"Token price {entry_price:.4f} in no-conviction zone "
-                            f"({config.CONVICTION_SKIP_LOW}-{config.CONVICTION_SKIP_HIGH}) — skipping"
-                        )
-                        continue
+                    low_conviction = config.CONVICTION_SKIP_LOW <= entry_price <= config.CONVICTION_SKIP_HIGH
+                    if low_conviction:
+                        logger.debug(f"Token price {entry_price:.4f} in low-conviction zone — trading but flagging")
+
                     order = polymarket.place_order(mid, token_id, side, position_size, entry_price)
                     if order:
                         database.insert_position(mid, side, entry_price, position_size,
                                                  btc_price, market.get("question"),
-                                                 window_start_ts=market.get("window_start_ts"))
+                                                 window_start_ts=market.get("window_start_ts"),
+                                                 low_conviction=low_conviction)
                         daily_trades += 1
                         logger.info(
                             f"Entered: market={mid} side={side} price={entry_price:.4f} "
