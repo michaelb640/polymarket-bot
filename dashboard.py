@@ -84,7 +84,7 @@ def api_stats():
         ).fetchall()
 
         all_closed_for_breakdown = conn.execute(
-            "SELECT exit_time, pnl, side FROM positions WHERE status='closed' ORDER BY exit_time DESC"
+            "SELECT exit_time, pnl, side FROM positions WHERE status='closed' ORDER BY exit_time ASC"
         ).fetchall()
 
         conviction_rows = conn.execute(
@@ -120,12 +120,16 @@ def api_stats():
     total_pnl = round(total_pnl_row["total"], 4) if total_pnl_row else 0.0
     account_balance = round(STARTING_BALANCE + total_pnl, 2)
 
-    # P&L curve for chart: cumulative pnl over closed trades today (oldest first)
+    # P&L curve + intraday drawdown for today
     pnl_curve: list[dict] = []
     cumulative = 0.0
+    today_min_pnl = 0.0
     for t in reversed(closed_list):
         cumulative += t["pnl"] or 0
+        if cumulative < today_min_pnl:
+            today_min_pnl = cumulative
         pnl_curve.append({"t": t["exit_time"], "pnl": round(cumulative, 4)})
+    intraday_drawdown = round(today_min_pnl, 2)
 
     # P&L by Pacific day (all history, no limit)
     all_for_breakdown = [dict(r) for r in all_closed_for_breakdown]
@@ -139,14 +143,19 @@ def api_stats():
         except Exception:
             continue
         if pacific_date not in day_map:
-            day_map[pacific_date] = {"date": pacific_date, "trades": 0, "wins": 0, "pnl": 0.0}
+            day_map[pacific_date] = {"date": pacific_date, "trades": 0, "wins": 0, "pnl": 0.0, "running": 0.0, "max_drawdown": 0.0}
         day_map[pacific_date]["trades"] += 1
         day_map[pacific_date]["wins"] += 1 if (t["pnl"] or 0) > 0 else 0
         day_map[pacific_date]["pnl"] += t["pnl"] or 0
+        day_map[pacific_date]["running"] += t["pnl"] or 0
+        if day_map[pacific_date]["running"] < day_map[pacific_date]["max_drawdown"]:
+            day_map[pacific_date]["max_drawdown"] = day_map[pacific_date]["running"]
     daily_breakdown = sorted(day_map.values(), key=lambda x: x["date"], reverse=True)
     for d in daily_breakdown:
         d["pnl"] = round(d["pnl"], 2)
+        d["max_drawdown"] = round(d["max_drawdown"], 2)
         d["win_rate"] = round(d["wins"] / d["trades"] * 100, 1) if d["trades"] else 0.0
+        del d["running"]
 
     # Conviction comparison
     conviction_comparison = {"high": None, "low": None}
@@ -177,6 +186,7 @@ def api_stats():
         pnl_curve=pnl_curve,
         daily_breakdown=daily_breakdown,
         conviction_comparison=conviction_comparison,
+        intraday_drawdown=intraday_drawdown,
         server_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     )
 
@@ -434,6 +444,7 @@ HTML = """<!DOCTYPE html>
       <div class="card-label">Daily P&amp;L</div>
       <div id="daily-pnl" class="card-value neutral">—</div>
       <div id="daily-pnl-pct" class="card-sub">of total balance</div>
+      <div id="daily-drawdown" class="card-sub" style="margin-top:2px">Max dip: —</div>
     </div>
     <div class="card">
       <div class="card-label">Win Rate</div>
@@ -655,16 +666,18 @@ function renderDailyBreakdown(days) {
     return;
   }
   let html = '<table><thead><tr>'
-    + '<th>Date (PST)</th><th>Trades</th><th>Win Rate</th><th>P&amp;L</th>'
+    + '<th>Date (PST)</th><th>Trades</th><th>Win Rate</th><th>P&amp;L</th><th>Max Dip</th>'
     + '</tr></thead><tbody>';
   for (const d of days) {
     const pnlClass = d.pnl > 0 ? 'positive' : d.pnl < 0 ? 'negative' : 'neutral';
     const wrClass = d.win_rate >= 50 ? 'positive' : 'negative';
+    const dipStr = d.max_drawdown < 0 ? `-$${Math.abs(d.max_drawdown).toFixed(2)}` : '$0.00';
     html += `<tr>
       <td>${d.date}</td>
       <td>${d.trades}</td>
       <td class="${wrClass}">${d.win_rate}%&nbsp;<span style="color:var(--muted);font-weight:400">(${d.wins}W / ${d.trades - d.wins}L)</span></td>
       <td class="${pnlClass}">${d.pnl >= 0 ? '+' : ''}$${d.pnl.toFixed(2)}</td>
+      <td style="color:var(--red)">${dipStr}</td>
     </tr>`;
   }
   html += '</tbody></table>';
@@ -706,6 +719,11 @@ async function refresh() {
     const pctEl = document.getElementById('daily-pnl-pct');
     pctEl.textContent = `${pctStr} of total balance`;
     pctEl.style.color = pct > 0 ? 'var(--green)' : pct < 0 ? 'var(--red)' : '';
+
+    const dipEl = document.getElementById('daily-drawdown');
+    const dip = d.intraday_drawdown || 0;
+    dipEl.textContent = dip < 0 ? `Max dip: -$${Math.abs(dip).toFixed(2)}` : 'Max dip: $0.00';
+    dipEl.style.color = dip < 0 ? 'var(--red)' : 'var(--muted)';
 
     const wrEl = document.getElementById('win-rate');
     wrEl.textContent = d.trades_today ? d.win_rate + '%' : '—';
