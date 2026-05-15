@@ -294,10 +294,10 @@ def run_bot() -> None:
 
                     token_id = token.get("token_id", mid)
 
-                    # Position size: 5%/10%/15% of account balance for score 2/3/4
-                    score_pct = {2: 0.05, 3: 0.10, 4: 0.15}
+                    # Position size: 3%/5%/8% of account balance for score 2/3/4
+                    score_pct = {2: 0.03, 3: 0.05, 4: 0.08}
                     balance = database.get_account_balance(config.STARTING_BALANCE)
-                    position_size = round(max(2.0, balance * score_pct.get(score, 0.05)), 2)
+                    position_size = round(max(2.0, balance * score_pct.get(score, 0.03)), 2)
 
                     # Prefer live CLOB best-ask over stale Gamma API price
                     clob_ask = polymarket.get_token_best_ask(token_id)

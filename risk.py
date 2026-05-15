@@ -62,7 +62,7 @@ def can_open_position(market_id: str) -> bool:
         logger.debug(f"Risk check: in cooldown after losing streak — {remaining}s remaining")
         return False
 
-    # Daily loss limit: stop if today's losses exceed 15% of account balance
+    # Daily loss limit: stop if today's losses exceed 7.5% of account balance
     daily_pnl = database.get_daily_pnl()
     if daily_pnl < 0:
         balance = database.get_account_balance(config.STARTING_BALANCE)
