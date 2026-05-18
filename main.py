@@ -314,14 +314,6 @@ def run_bot() -> None:
                         )
                         continue
 
-                    # EV gate: only enter when expected value clears the minimum edge
-                    ev = strategy.compute_ev(score, entry_price)
-                    if ev < config.MIN_EDGE:
-                        logger.debug(
-                            f"EV {ev:.4f} < MIN_EDGE {config.MIN_EDGE} for score={score} price={entry_price:.4f} — skipping"
-                        )
-                        continue
-
                     low_conviction = config.CONVICTION_SKIP_LOW <= entry_price <= config.CONVICTION_SKIP_HIGH
                     if low_conviction:
                         logger.debug(f"Token price {entry_price:.4f} in low-conviction zone — trading but flagging")
@@ -343,7 +335,7 @@ def run_bot() -> None:
                         logger.info(
                             f"Entered: market={mid} side={side} price={entry_price:.4f} "
                             f"size={position_size:.2f}sh (${risk_dollars:.2f} at risk) "
-                            f"score={score} ev={ev:.4f} balance=${balance:.2f}"
+                            f"score={score} balance=${balance:.2f}"
                         )
 
             open_positions = database.get_open_positions()

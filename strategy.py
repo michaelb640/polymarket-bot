@@ -96,14 +96,6 @@ def generate_signal(prices: list[float], opening_price: float | None = None,
     return raw, score
 
 
-def compute_ev(score: int, entry_price: float) -> float:
-    """
-    Expected value = P(win) - entry_price.
-    P(win) per score is configured in config.py. Calibrate those values using
-    the score breakdown printed by --backtest once you have enough live data.
-    """
-    p_win = {2: config.P_WIN_SCORE_2, 3: config.P_WIN_SCORE_3, 4: config.P_WIN_SCORE_4}
-    return p_win.get(score, config.P_WIN_SCORE_2) - entry_price
 
 
 def get_entry_side(signal: str, market: dict) -> str | None:
