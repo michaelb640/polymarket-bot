@@ -517,7 +517,7 @@ def run_backtest() -> None:
     gross_pnl = sum(t["pnl"] for t in trades)
     total_fees = sum(t["fee"] for t in trades)
     win_rate = len(winners) / total * 100
-    breakeven_wr = (0.50 + SLIPPAGE) / (1.0 - (0.50 + SLIPPAGE)) * 100  # ~53%
+    breakeven_wr = (0.50 + SLIPPAGE) * 100  # entry_price = breakeven win rate for binary bets
 
     print("\n" + "=" * 64)
     print("  BACKTEST RESULTS — BTC 5-min  (7 days, fees + slippage)")
