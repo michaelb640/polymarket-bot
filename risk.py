@@ -81,5 +81,3 @@ def can_open_position(market_id: str) -> bool:
     return True
 
 
-def size_order(available_capital: float = None) -> float:
-    return config.POSITION_SIZE

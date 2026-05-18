@@ -10,11 +10,13 @@ import config
 # ---------------------------------------------------------------------------
 
 def generate_signal(prices: list[float], opening_price: float | None = None,
-                    hourly_trend: str | None = None) -> tuple[str, int]:
+                    hourly_trend: str | None = None,
+                    realized_vol: float = 0.02) -> tuple[str, int]:
     """
     prices: BTC prices sampled every 10 seconds, most recent last (up to 30 samples).
     opening_price: BTC price at the start of the current 5-min market window (the "price to beat").
     hourly_trend: 'UP', 'DOWN', or None — signals opposing the 1-hour trend are vetoed.
+    realized_vol: daily realized vol (from price_feed); scales thresholds to the current regime.
     Returns (signal, score) where signal is 'UP', 'DOWN', or 'SKIP' and score is 0-4.
     """
     if len(prices) < 12:
@@ -22,12 +24,16 @@ def generate_signal(prices: list[float], opening_price: float | None = None,
 
     current = prices[-1]
 
-    # Signal 1: short momentum — last 60s vs previous 60s (threshold halved)
+    # Scale thresholds by current vol relative to 2% daily baseline (clamped 0.5x–2x).
+    # In quiet regimes thresholds shrink (catch smaller moves); in volatile ones they grow (filter noise).
+    vol_scale = max(0.5, min(2.0, realized_vol / 0.02))
+
+    # Signal 1: short momentum — last 60s vs previous 60s
     recent = sum(prices[-6:]) / 6
     prior = sum(prices[-12:-6]) / 6
     momentum = (recent - prior) / prior
 
-    # Signal 2: micro trend — linear regression slope over last 2 minutes (threshold halved)
+    # Signal 2: micro trend — linear regression slope over last 2 minutes
     x = list(range(len(prices[-12:])))
     y = prices[-12:]
     slope = float(np.polyfit(x, y, 1)[0])
@@ -43,31 +49,29 @@ def generate_signal(prices: list[float], opening_price: float | None = None,
     up_score = 0
     down_score = 0
 
-    if momentum > 0.00015:
+    if momentum > 0.00015 * vol_scale:
         up_score += 1
-    elif momentum < -0.00015:
+    elif momentum < -0.00015 * vol_scale:
         down_score += 1
 
-    if trend > 0.00005:
+    if trend > 0.00005 * vol_scale:
         up_score += 1
-    elif trend < -0.00005:
+    elif trend < -0.00005 * vol_scale:
         down_score += 1
 
-    # Mean reversion from 5m average
-    if deviation > 0.001:
+    if deviation > 0.001 * vol_scale:
         down_score += 1
-    elif deviation < -0.001:
+    elif deviation < -0.001 * vol_scale:
         up_score += 1
 
-    # Opening price: below opening → Down currently winning → Up is the catch-up trade
     if opening_price is not None:
-        if opening_dev < -0.0005:    # BTC > 0.05% below opening
+        if opening_dev < -0.0005 * vol_scale:
             up_score += 1
-        elif opening_dev > 0.0005:   # BTC > 0.05% above opening
+        elif opening_dev > 0.0005 * vol_scale:
             down_score += 1
 
     logger.debug(
-        f"Signal scores: up={up_score} down={down_score} | "
+        f"Signal scores: up={up_score} down={down_score} vol_scale={vol_scale:.2f} | "
         f"momentum={momentum:.6f} trend={trend:.6f} deviation={deviation:.6f} "
         f"opening_dev={opening_dev:.6f} hourly_trend={hourly_trend}"
     )
@@ -90,6 +94,16 @@ def generate_signal(prices: list[float], opening_price: float | None = None,
         return "SKIP", 0
 
     return raw, score
+
+
+def compute_ev(score: int, entry_price: float) -> float:
+    """
+    Expected value = P(win) - entry_price.
+    P(win) per score is configured in config.py. Calibrate those values using
+    the score breakdown printed by --backtest once you have enough live data.
+    """
+    p_win = {2: config.P_WIN_SCORE_2, 3: config.P_WIN_SCORE_3, 4: config.P_WIN_SCORE_4}
+    return p_win.get(score, config.P_WIN_SCORE_2) - entry_price
 
 
 def get_entry_side(signal: str, market: dict) -> str | None:

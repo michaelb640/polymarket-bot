@@ -144,15 +144,14 @@ def _check_resolutions(open_positions: list[dict]) -> None:
                 )
             continue
 
-        if True:
-            pnl = strategy.compute_pnl(pos, resolution)
-            won = pnl > 0
-            logger.info(
-                f"Position resolved: market={pos['market_id']} side={pos['side']} "
-                f"resolution={resolution} pnl=${pnl:.4f}"
-            )
-            database.update_position_closed(pos["id"], resolution, pnl)
-            risk.record_trade_result(won)
+        pnl = strategy.compute_pnl(pos, resolution)
+        won = pnl > 0
+        logger.info(
+            f"Position resolved: market={pos['market_id']} side={pos['side']} "
+            f"resolution={resolution} pnl=${pnl:.4f}"
+        )
+        database.update_position_closed(pos["id"], resolution, pnl)
+        risk.record_trade_result(won)
 
 
 def _parse_ts(iso_str: str) -> float:
@@ -240,7 +239,7 @@ def run_bot() -> None:
                 daily_trades = 0
                 last_day = today
 
-            btc_price, _ = price_feed.get_btc_data()
+            btc_price, daily_vol = price_feed.get_btc_data()
             prices = price_feed.get_price_buffer()
             hourly_trend = price_feed.get_hourly_trend()
 
@@ -255,12 +254,16 @@ def run_bot() -> None:
             open_positions = database.get_open_positions()
 
             # Generate base signal (without opening price — used as a fast pre-filter)
-            last_signal, _ = strategy.generate_signal(prices, hourly_trend=hourly_trend)
+            last_signal, _ = strategy.generate_signal(prices, hourly_trend=hourly_trend, realized_vol=daily_vol)
 
             # Entry logic
             if last_signal != "SKIP":
                 active_markets = polymarket.get_active_btc_markets()
                 now = time.time()
+
+                # Prune stale market entries (older than 10 min) to prevent unbounded growth
+                for stale in [k for k, v in _known_markets.items() if now - v.get("ts", 0) > 600]:
+                    del _known_markets[stale]
 
                 for market in active_markets:
                     mid = market["condition_id"]
@@ -276,9 +279,9 @@ def run_bot() -> None:
                     if not risk.can_open_position(mid):
                         continue
 
-                    # Re-score with opening price + hourly trend veto
+                    # Re-score with opening price + hourly trend veto + vol context
                     opening_price = _get_opening_price(market)
-                    signal, score = strategy.generate_signal(prices, opening_price, hourly_trend)
+                    signal, score = strategy.generate_signal(prices, opening_price, hourly_trend, realized_vol=daily_vol)
                     if signal == "SKIP":
                         logger.debug(f"Signal filtered to SKIP after opening price/trend context for {mid}")
                         continue
@@ -294,15 +297,16 @@ def run_bot() -> None:
 
                     token_id = token.get("token_id", mid)
 
-                    # Position size: 3%/5%/8% of account balance for score 2/3/4
-                    score_pct = {2: 0.03, 3: 0.05, 4: 0.08}
-                    balance = database.get_account_balance(config.STARTING_BALANCE)
-                    position_size = round(max(2.0, balance * score_pct.get(score, 0.03)), 2)
-
-                    # Prefer live CLOB best-ask over stale Gamma API price
-                    clob_ask = polymarket.get_token_best_ask(token_id)
+                    # Fetch bid/ask spread: skip wide-spread markets (adverse selection)
+                    clob_bid, clob_ask = polymarket.get_token_spread(token_id)
                     entry_price = clob_ask if clob_ask is not None else float(token.get("price", 0.5))
-                    logger.debug(f"Token price: clob_ask={clob_ask} gamma={token.get('price')} using={entry_price:.4f}")
+                    logger.debug(f"Token: bid={clob_bid} ask={clob_ask} gamma={token.get('price')} using={entry_price:.4f}")
+
+                    if clob_bid is not None and clob_ask is not None:
+                        spread = clob_ask - clob_bid
+                        if spread > config.MAX_SPREAD:
+                            logger.debug(f"Spread {spread:.4f} > MAX_SPREAD {config.MAX_SPREAD} — skipping {mid}")
+                            continue
 
                     if entry_price > config.MAX_ENTRY_PRICE:
                         logger.debug(
@@ -310,9 +314,24 @@ def run_bot() -> None:
                         )
                         continue
 
+                    # EV gate: only enter when expected value clears the minimum edge
+                    ev = strategy.compute_ev(score, entry_price)
+                    if ev < config.MIN_EDGE:
+                        logger.debug(
+                            f"EV {ev:.4f} < MIN_EDGE {config.MIN_EDGE} for score={score} price={entry_price:.4f} — skipping"
+                        )
+                        continue
+
                     low_conviction = config.CONVICTION_SKIP_LOW <= entry_price <= config.CONVICTION_SKIP_HIGH
                     if low_conviction:
                         logger.debug(f"Token price {entry_price:.4f} in low-conviction zone — trading but flagging")
+
+                    # Risk-based sizing: target risk_pct of balance as max loss per trade.
+                    # position_size (shares) = risk_dollars / entry_price so cost = risk_dollars.
+                    score_risk = {2: 0.03, 3: 0.05, 4: 0.08}
+                    balance = database.get_account_balance(config.STARTING_BALANCE)
+                    risk_dollars = balance * score_risk.get(score, 0.03)
+                    position_size = round(max(2.0, risk_dollars / entry_price), 2)
 
                     order = polymarket.place_order(mid, token_id, side, position_size, entry_price)
                     if order:
@@ -323,7 +342,8 @@ def run_bot() -> None:
                         daily_trades += 1
                         logger.info(
                             f"Entered: market={mid} side={side} price={entry_price:.4f} "
-                            f"size=${position_size} score={score} balance=${balance:.2f} opening_price={opening_price}"
+                            f"size={position_size:.2f}sh (${risk_dollars:.2f} at risk) "
+                            f"score={score} ev={ev:.4f} balance=${balance:.2f}"
                         )
 
             open_positions = database.get_open_positions()
@@ -358,110 +378,162 @@ def _write_daily_summary() -> None:
 def run_backtest() -> None:
     """
     Simulate the 5-minute signal strategy on 7 days of Binance 5m candles.
-    Each candle is treated as one 5-minute market cycle.
-    Within each cycle we build a 12-sample price sub-series from the OHLC data
-    to approximate the intra-candle price path, then run generate_signal().
-    """
-    logger.info("Starting backtest (7 days, 5-min BTC candles)...")
 
+    Key improvements over the old version:
+    - OHLC-based intra-candle paths (no straight-line lookahead bias)
+    - Signal generated from PREVIOUS candle's buffer, not the current one
+    - Hourly trend filter applied (was missing before)
+    - Taker fee (1.56%) and 2c slippage simulated
+    - Win rate broken out by score — use this to calibrate P_WIN_SCORE_* in config
+    """
     import requests
-    import numpy as np
+    import math as _math
 
     KLINES_URL = "https://api.binance.us/api/v3/klines"
+    FEE_RATE = 0.0156   # Polymarket taker fee
+    SLIPPAGE = 0.02     # simulated bid-ask half-spread on entry
+    SHARES = 20.0       # shares per trade (~$10 at 0.50 mid)
+
+    logger.info("Starting backtest (7 days, 5-min BTC candles)...")
+
     try:
-        params = {"symbol": "BTCUSD", "interval": "5m", "limit": 2016}
-        resp = requests.get(KLINES_URL, params=params, timeout=15)
+        resp = requests.get(KLINES_URL, params={"symbol": "BTCUSD", "interval": "5m", "limit": 2016}, timeout=15)
         resp.raise_for_status()
         klines = resp.json()
     except Exception as e:
-        logger.error(f"Backtest: failed to fetch candles: {e}")
+        logger.error(f"Backtest: failed to fetch 5m candles: {e}")
         return
 
-    trades = []
+    try:
+        resp = requests.get(KLINES_URL, params={"symbol": "BTCUSD", "interval": "1h", "limit": 200}, timeout=15)
+        resp.raise_for_status()
+        hourly_map = {int(k[0]) // 1000: float(k[4]) for k in resp.json()}
+    except Exception as e:
+        logger.warning(f"Backtest: hourly candles unavailable ({e}); trend filter disabled")
+        hourly_map = {}
+
+    def _hourly_trend(ts: int) -> str | None:
+        hour = (ts // 3600) * 3600
+        closes = [hourly_map.get(hour - i * 3600) for i in range(3, -1, -1)]
+        closes = [c for c in closes if c is not None]
+        if len(closes) < 4:
+            return None
+        pct = (closes[-1] - closes[0]) / closes[0]
+        if pct > 0.001: return "UP"
+        if pct < -0.001: return "DOWN"
+        return None
+
+    def _build_ohlc_path(o: float, h: float, l: float, c: float) -> list[float]:
+        # Bullish candle: dip before rally (O→L→H→C); bearish: spike before drop (O→H→L→C)
+        waypoints = [o, l, h, c] if c >= o else [o, h, l, c]
+        path = []
+        for i in range(12):
+            t = i / 11.0 * 3          # maps 0..11 → 0..3 across 4 waypoints
+            idx = min(int(t), 2)
+            frac = t - idx
+            path.append(waypoints[idx] + frac * (waypoints[idx + 1] - waypoints[idx]))
+        return path
+
+    trades: list[dict] = []
     consecutive_losses = 0
     daily_trades = 0
-    last_day = None
+    daily_pnl = 0.0
+    last_day: str | None = None
     price_history: list[float] = []
+    prev_candle_path: list[float] | None = None
 
     for candle in klines:
+        ts      = int(candle[0]) // 1000
         open_p  = float(candle[1])
         high_p  = float(candle[2])
         low_p   = float(candle[3])
         close_p = float(candle[4])
-        ts_ms   = int(candle[0])
 
-        day_str = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        day_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
         if day_str != last_day:
             daily_trades = 0
+            daily_pnl = 0.0
             consecutive_losses = 0
             last_day = day_str
 
-        # Build a 12-point intra-candle path: open → high/low midpoint → close
-        # (crude but deterministic approximation of 10s samples)
-        mid_path = [
-            open_p + (close_p - open_p) * i / 11
-            for i in range(12)
-        ]
-        price_history.extend(mid_path)
-        if len(price_history) > 30:
-            price_history = price_history[-30:]
+        current_path = _build_ohlc_path(open_p, high_p, low_p, close_p)
 
-        if daily_trades >= config.MAX_DAILY_TRADES:
-            continue
-        if consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
-            continue
+        # Signal uses the PREVIOUS candle's price buffer to predict THIS candle.
+        # This mirrors live trading (signal fires in the first 90s of a new window
+        # using data from the prior window), eliminating lookahead.
+        if prev_candle_path is not None:
+            price_history.extend(prev_candle_path)
+            if len(price_history) > 30:
+                price_history = price_history[-30:]
 
-        signal, _ = strategy.generate_signal(price_history)
-        if signal == "SKIP":
-            continue
+            if (daily_trades < config.MAX_DAILY_TRADES
+                    and consecutive_losses < config.MAX_CONSECUTIVE_LOSSES
+                    and len(price_history) >= 12):
 
-        entry_price = 0.50
-        if not (config.MIN_MARKET_PRICE <= entry_price <= config.MAX_MARKET_PRICE):
-            continue
+                balance = config.STARTING_BALANCE + sum(t["pnl"] for t in trades)
+                if not (daily_pnl < 0 and abs(daily_pnl) >= balance * config.DAILY_LOSS_LIMIT_PCT):
 
-        # Resolution: did price go UP or DOWN?
-        resolution = 1.0 if close_p >= open_p else 0.0
-        side = "YES" if signal == "UP" else "NO"
-        pos = {"side": side, "entry_price": entry_price, "size": config.POSITION_SIZE}
-        pnl = strategy.compute_pnl(pos, resolution)
-        won = pnl > 0
+                    # Approximate realized vol from rolling price history
+                    rets = [_math.log(price_history[i] / price_history[i - 1])
+                            for i in range(1, len(price_history))]
+                    mean_r = sum(rets) / len(rets)
+                    var = sum((r - mean_r) ** 2 for r in rets) / max(len(rets) - 1, 1)
+                    realized_vol = max(0.005, min(0.10, _math.sqrt(var) * _math.sqrt(8640)))
 
-        if won:
-            consecutive_losses = 0
-        else:
-            consecutive_losses += 1
+                    hourly_trend = _hourly_trend(ts)
 
-        daily_trades += 1
-        trades.append({"side": side, "pnl": pnl, "signal": signal, "day": day_str})
+                    # opening_price = start of this window (price to beat)
+                    signal, score = strategy.generate_signal(
+                        price_history, opening_price=open_p,
+                        hourly_trend=hourly_trend, realized_vol=realized_vol
+                    )
+
+                    if signal != "SKIP":
+                        entry_price = 0.50 + SLIPPAGE
+                        resolution = 1.0 if close_p >= open_p else 0.0
+                        side = "YES" if signal == "UP" else "NO"
+                        pos = {"side": side, "entry_price": entry_price, "size": SHARES}
+                        raw_pnl = strategy.compute_pnl(pos, resolution)
+                        fee = SHARES * entry_price * FEE_RATE
+                        pnl = raw_pnl - fee
+                        won = pnl > 0
+
+                        consecutive_losses = 0 if won else consecutive_losses + 1
+                        daily_trades += 1
+                        daily_pnl += pnl
+                        trades.append({
+                            "pnl": pnl, "raw_pnl": raw_pnl, "fee": fee,
+                            "signal": signal, "score": score, "won": won, "day": day_str,
+                        })
+
+        prev_candle_path = current_path
 
     if not trades:
         print("\nBacktest: no trades generated.")
         return
 
     total = len(trades)
-    winners = [t for t in trades if t["pnl"] > 0]
-    losers = [t for t in trades if t["pnl"] <= 0]
+    winners = [t for t in trades if t["won"]]
     gross_pnl = sum(t["pnl"] for t in trades)
+    total_fees = sum(t["fee"] for t in trades)
     win_rate = len(winners) / total * 100
-    avg_win = sum(t["pnl"] for t in winners) / len(winners) if winners else 0
-    avg_loss = sum(t["pnl"] for t in losers) / len(losers) if losers else 0
+    breakeven_wr = (0.50 + SLIPPAGE) / (1.0 - (0.50 + SLIPPAGE)) * 100  # ~53%
 
-    by_signal: dict[str, int] = {}
-    for t in trades:
-        by_signal[t["signal"]] = by_signal.get(t["signal"], 0) + 1
-
-    print("\n" + "=" * 58)
-    print("  BACKTEST RESULTS — BTC 5-min markets (7 days)")
-    print("=" * 58)
-    print(f"  Total trades      : {total}")
-    print(f"  Winners           : {len(winners)} ({win_rate:.1f}%)")
-    print(f"  Losers            : {len(losers)}")
-    print(f"  Gross P&L         : ${gross_pnl:.2f}")
-    print(f"  Avg win           : ${avg_win:.2f}")
-    print(f"  Avg loss          : ${avg_loss:.2f}")
-    for sig, count in by_signal.items():
-        print(f"  Signal [{sig}]       : {count} trades")
-    print("=" * 58 + "\n")
+    print("\n" + "=" * 64)
+    print("  BACKTEST RESULTS — BTC 5-min  (7 days, fees + slippage)")
+    print("=" * 64)
+    print(f"  Total trades    : {total}")
+    print(f"  Win rate        : {win_rate:.1f}%  (breakeven ≈ {breakeven_wr:.1f}%)")
+    print(f"  Net P&L         : ${gross_pnl:.2f}")
+    print(f"  Total fees paid : ${total_fees:.2f}")
+    print()
+    print("  Score breakdown — use to calibrate P_WIN_SCORE_* in config:")
+    for s in (2, 3, 4):
+        st = [t for t in trades if t["score"] == s]
+        if st:
+            sw = sum(1 for t in st if t["won"])
+            print(f"    Score {s}: {len(st):3d} trades   win={sw/len(st)*100:.1f}%   pnl=${sum(t['pnl'] for t in st):.2f}")
+    print("=" * 64 + "\n")
 
 
 # ---------------------------------------------------------------------------

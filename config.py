@@ -50,3 +50,13 @@ DAILY_LOSS_LIMIT: float = _float("DAILY_LOSS_LIMIT", 100.0)
 DAILY_LOSS_LIMIT_PCT: float = _float("DAILY_LOSS_LIMIT_PCT", 0.075)
 ENTRY_THRESHOLD: float = _float("ENTRY_THRESHOLD", 0.07)
 FORCE_CLOSE_MINUTES_BEFORE_RESOLUTION: int = 0
+
+# EV gate: only enter when expected value exceeds this threshold
+# P_WIN_SCORE_* are initial estimates — update them using backtest score breakdown
+MIN_EDGE: float = _float("MIN_EDGE", 0.03)
+P_WIN_SCORE_2: float = _float("P_WIN_SCORE_2", 0.53)
+P_WIN_SCORE_3: float = _float("P_WIN_SCORE_3", 0.56)
+P_WIN_SCORE_4: float = _float("P_WIN_SCORE_4", 0.60)
+
+# Market quality: skip if bid-ask spread is too wide
+MAX_SPREAD: float = _float("MAX_SPREAD", 0.04)

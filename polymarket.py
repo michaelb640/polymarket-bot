@@ -128,6 +128,35 @@ def get_token_for_signal(market: dict, signal: str) -> dict | None:
     return None
 
 
+def get_token_spread(token_id: str) -> tuple[float | None, float | None]:
+    """
+    Return (best_bid, best_ask) from the CLOB orderbook in a single call.
+    Returns (None, None) on error so callers fall back gracefully.
+    """
+    client = _get_read_client()
+    if client is None:
+        return None, None
+    try:
+        book = client.get_order_book(token_id)
+        best_bid, best_ask = None, None
+        for b in (book.bids or []):
+            try:
+                p = float(b["price"] if isinstance(b, dict) else b.price)
+                best_bid = p if best_bid is None else max(best_bid, p)
+            except (KeyError, AttributeError, TypeError, ValueError):
+                continue
+        for a in (book.asks or []):
+            try:
+                p = float(a["price"] if isinstance(a, dict) else a.price)
+                best_ask = p if best_ask is None else min(best_ask, p)
+            except (KeyError, AttributeError, TypeError, ValueError):
+                continue
+        return best_bid, best_ask
+    except Exception as e:
+        logger.error(f"CLOB spread fetch failed for {token_id[:16]}...: {e}")
+        return None, None
+
+
 def get_token_best_ask(token_id: str) -> float | None:
     """
     Fetch the real best-ask price from the CLOB orderbook for a specific token.
