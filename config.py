@@ -38,10 +38,9 @@ STARTING_BALANCE: float = _float("STARTING_BALANCE", 100.0)
 POSITION_SIZE: float = _float("POSITION_SIZE", 10.0)
 MAX_DAILY_TRADES: int = _int("MAX_DAILY_TRADES", 20)
 MAX_CONSECUTIVE_LOSSES: int = _int("MAX_CONSECUTIVE_LOSSES", 8)
-ENTRY_WINDOW_SECONDS: int = _int("ENTRY_WINDOW_SECONDS", 90)
+ENTRY_WINDOW_SECONDS: int = _int("ENTRY_WINDOW_SECONDS", 240)
+MIN_ENTRY_PRICE: float = _float("MIN_ENTRY_PRICE", 0.35)  # skip if token already <35¢ (market has strong consensus against us)
 MAX_ENTRY_PRICE: float = _float("MAX_ENTRY_PRICE", 0.80)  # skip if token already >80¢ (market has strong consensus)
-CONVICTION_SKIP_LOW: float = _float("CONVICTION_SKIP_LOW", 0.46)   # skip trades priced between these two values
-CONVICTION_SKIP_HIGH: float = _float("CONVICTION_SKIP_HIGH", 0.54) # — market has no conviction near 50¢
 
 # Legacy daily-market settings kept for backtest compatibility
 MAX_POSITION_SIZE: float = POSITION_SIZE

@@ -308,15 +308,13 @@ def run_bot() -> None:
                             logger.debug(f"Spread {spread:.4f} > MAX_SPREAD {config.MAX_SPREAD} — skipping {mid}")
                             continue
 
-                    if entry_price > config.MAX_ENTRY_PRICE:
-                        logger.debug(
-                            f"Token price {entry_price:.4f} > MAX_ENTRY_PRICE {config.MAX_ENTRY_PRICE} — skipping"
-                        )
+                    if entry_price < config.MIN_ENTRY_PRICE:
+                        logger.debug(f"Token price {entry_price:.4f} < MIN_ENTRY_PRICE {config.MIN_ENTRY_PRICE} — skipping")
                         continue
 
-                    low_conviction = config.CONVICTION_SKIP_LOW <= entry_price <= config.CONVICTION_SKIP_HIGH
-                    if low_conviction:
-                        logger.debug(f"Token price {entry_price:.4f} in low-conviction zone — trading but flagging")
+                    if entry_price > config.MAX_ENTRY_PRICE:
+                        logger.debug(f"Token price {entry_price:.4f} > MAX_ENTRY_PRICE {config.MAX_ENTRY_PRICE} — skipping")
+                        continue
 
                     # Risk-based sizing: target risk_pct of balance as max loss per trade.
                     # position_size (shares) = risk_dollars / entry_price so cost = risk_dollars.
@@ -329,8 +327,7 @@ def run_bot() -> None:
                     if order:
                         database.insert_position(mid, side, entry_price, position_size,
                                                  btc_price, market.get("question"),
-                                                 window_start_ts=market.get("window_start_ts"),
-                                                 low_conviction=low_conviction)
+                                                 window_start_ts=market.get("window_start_ts"))
                         daily_trades += 1
                         logger.info(
                             f"Entered: market={mid} side={side} price={entry_price:.4f} "

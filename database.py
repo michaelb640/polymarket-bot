@@ -49,7 +49,7 @@ def init_db() -> None:
             )
         """)
         # Migrate existing tables that predate new columns
-        for col in ("btc_entry_price REAL", "market_name TEXT", "window_start_ts INTEGER", "low_conviction INTEGER DEFAULT 0"):
+        for col in ("btc_entry_price REAL", "market_name TEXT", "window_start_ts INTEGER"):
             try:
                 conn.execute(f"ALTER TABLE positions ADD COLUMN {col}")
             except Exception:
@@ -71,18 +71,18 @@ def init_db() -> None:
 
 def insert_position(market_id: str, side: str, entry_price: float, size: float,
                     btc_entry_price: float | None = None, market_name: str | None = None,
-                    window_start_ts: int | None = None, low_conviction: bool = False) -> int:
+                    window_start_ts: int | None = None) -> int:
     entry_time = datetime.utcnow().isoformat()
     with _connect() as conn:
         cursor = conn.execute(
             """INSERT INTO positions
-               (market_id, side, entry_price, btc_entry_price, market_name, size, entry_time, status, window_start_ts, low_conviction)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
-            (market_id, side, entry_price, btc_entry_price, market_name, size, entry_time, window_start_ts, int(low_conviction)),
+               (market_id, side, entry_price, btc_entry_price, market_name, size, entry_time, status, window_start_ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)""",
+            (market_id, side, entry_price, btc_entry_price, market_name, size, entry_time, window_start_ts),
         )
         conn.commit()
         row_id = cursor.lastrowid
-    logger.debug(f"Inserted position id={row_id} market={market_name or market_id} side={side} btc=${btc_entry_price} low_conviction={low_conviction}")
+    logger.debug(f"Inserted position id={row_id} market={market_name or market_id} side={side} btc=${btc_entry_price}")
     return row_id
 
 
