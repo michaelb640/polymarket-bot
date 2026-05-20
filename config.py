@@ -55,3 +55,9 @@ MAX_SPREAD: float = _float("MAX_SPREAD", 0.04)
 
 # Order execution mode: True = post limit order at mid (maker, 0% fee); False = hit ask (taker, 1.56% fee)
 USE_MAKER_ORDERS: bool = _bool("USE_MAKER_ORDERS", True)
+
+# YES/NO arbitrage scanner
+ARB_NOTIONAL: float = _float("ARB_NOTIONAL", 20.0)         # $ per arb (split equally across both legs)
+ARB_EXECUTE_THRESHOLD: float = _float("ARB_EXECUTE_THRESHOLD", 0.97)  # execute only if YES_ask + NO_ask < this
+ARB_LOG_THRESHOLD: float = _float("ARB_LOG_THRESHOLD", 0.985)         # log (but don't execute) below this
+ARB_POLL_SECONDS: int = _int("ARB_POLL_SECONDS", 5)                   # scan frequency in seconds
