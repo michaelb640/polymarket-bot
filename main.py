@@ -10,6 +10,7 @@ from datetime import datetime, timezone, date, timedelta
 from zoneinfo import ZoneInfo
 
 _PACIFIC = ZoneInfo("America/Los_Angeles")
+_WEEKEND_DAYS = frozenset({4, 5, 6})  # Fri=4, Sat=5, Sun=6 — no new entries
 
 import config
 import database
@@ -256,8 +257,12 @@ def run_bot() -> None:
             # Generate base signal (without opening price — used as a fast pre-filter)
             last_signal, _ = strategy.generate_signal(prices, hourly_trend=hourly_trend, realized_vol=daily_vol)
 
+            # Weekend block: no new entries Fri/Sat/Sun (Pacific time)
+            if today.weekday() in _WEEKEND_DAYS:
+                last_signal = "WEEKEND"
+
             # Entry logic
-            if last_signal != "SKIP":
+            if last_signal not in ("SKIP", "WEEKEND"):
                 active_markets = polymarket.get_active_btc_markets()
                 now = time.time()
 
