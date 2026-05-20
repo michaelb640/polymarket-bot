@@ -246,6 +246,41 @@ def cancel_order(order_id: str) -> bool:
         return False
 
 
+def cancel_all_open_orders() -> None:
+    """Cancel all open limit orders on the CLOB. Called on startup to clear stale state."""
+    client = _get_client()
+    if config.DRY_RUN or client is None:
+        logger.info("[DRY_RUN] cancel_all_open_orders: no-op")
+        return
+    try:
+        client.cancel_all()
+        logger.info("All open CLOB orders cancelled.")
+    except AttributeError:
+        logger.info("cancel_all() not available in this py-clob-client version; skipping.")
+    except Exception as e:
+        logger.error(f"cancel_all_open_orders failed: {e}")
+
+
+def get_order_status(order_id: str) -> str | None:
+    """
+    Returns order status: 'LIVE', 'MATCHED', 'CANCELLED', or None on error.
+    Mock orders (DRY_RUN) always return 'MATCHED' to simulate an immediate fill.
+    """
+    if order_id.startswith("mock_"):
+        return "MATCHED"
+    client = _get_read_client()
+    if client is None:
+        return None
+    try:
+        resp = client.get_order(order_id)
+        if isinstance(resp, dict):
+            return resp.get("status")
+        return getattr(resp, "status", None)
+    except Exception as e:
+        logger.error(f"get_order_status failed for {order_id[:16]}: {e}")
+        return None
+
+
 def get_open_positions() -> list[dict]:
     client = _get_client()
     if config.DRY_RUN or client is None:

@@ -52,3 +52,6 @@ FORCE_CLOSE_MINUTES_BEFORE_RESOLUTION: int = 0
 
 # Market quality: skip if bid-ask spread is too wide
 MAX_SPREAD: float = _float("MAX_SPREAD", 0.04)
+
+# Order execution mode: True = post limit order at mid (maker, 0% fee); False = hit ask (taker, 1.56% fee)
+USE_MAKER_ORDERS: bool = _bool("USE_MAKER_ORDERS", True)
