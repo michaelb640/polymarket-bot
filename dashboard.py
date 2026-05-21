@@ -87,16 +87,6 @@ def api_stats():
             "SELECT exit_time, pnl, side FROM positions WHERE status='closed' ORDER BY exit_time ASC"
         ).fetchall()
 
-        conviction_rows = conn.execute(
-            """SELECT
-                low_conviction,
-                COUNT(*) as trades,
-                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                ROUND(SUM(pnl), 2) as pnl
-               FROM positions WHERE status='closed'
-               GROUP BY low_conviction"""
-        ).fetchall()
-
         daily_pnl_row = conn.execute(
             "SELECT COALESCE(SUM(pnl),0) as total FROM positions WHERE status='closed' AND exit_time >= ? AND exit_time < ?",
             (start_utc, end_utc),
@@ -105,6 +95,34 @@ def api_stats():
         total_pnl_row = conn.execute(
             "SELECT COALESCE(SUM(pnl),0) as total FROM positions WHERE status='closed'"
         ).fetchone()
+
+    # Arb monitor stats (separate table, may not exist yet)
+    arb_stats = {"detected": 0, "executed": 0, "dry_run": 0, "est_pnl": 0.0}
+    arb_events_list = []
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM arb_events WHERE event_type IN ('detected','dry_run','executed')"
+            ).fetchone()
+            arb_stats["detected"] = row["cnt"] if row else 0
+
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM arb_events WHERE event_type='dry_run'"
+            ).fetchone()
+            arb_stats["dry_run"] = row["cnt"] if row else 0
+
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt, COALESCE(SUM(est_pnl),0) as pnl FROM arb_events WHERE event_type='executed'"
+            ).fetchone()
+            arb_stats["executed"] = row["cnt"] if row else 0
+            arb_stats["est_pnl"] = round(float(row["pnl"]), 4) if row else 0.0
+
+            rows = conn.execute(
+                "SELECT * FROM arb_events ORDER BY event_time DESC LIMIT 30"
+            ).fetchall()
+            arb_events_list = [dict(r) for r in rows]
+    except Exception:
+        pass  # table doesn't exist yet on older DB
 
     open_positions = [dict(r) for r in open_rows]
     for p in open_positions:
@@ -157,21 +175,6 @@ def api_stats():
         d["win_rate"] = round(d["wins"] / d["trades"] * 100, 1) if d["trades"] else 0.0
         del d["running"]
 
-    # Conviction comparison
-    conviction_comparison = {"high": None, "low": None}
-    for row in conviction_rows:
-        r = dict(row)
-        trades = r["trades"]
-        wins = r["wins"]
-        key = "low" if r["low_conviction"] else "high"
-        conviction_comparison[key] = {
-            "trades": trades,
-            "wins": wins,
-            "losses": trades - wins,
-            "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
-            "pnl": round(r["pnl"] or 0, 2),
-        }
-
     return jsonify(
         btc_price=btc,
         daily_pnl=daily_pnl,
@@ -185,7 +188,8 @@ def api_stats():
         all_closed=all_closed_list,
         pnl_curve=pnl_curve,
         daily_breakdown=daily_breakdown,
-        conviction_comparison=conviction_comparison,
+        arb_stats=arb_stats,
+        arb_events=arb_events_list,
         intraday_drawdown=intraday_drawdown,
         server_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     )
@@ -486,9 +490,18 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <div class="section">
-    <div class="section-header">Conviction Filter Comparison (All Time)</div>
-    <div id="conviction-body">
-      <div class="empty">No data yet.</div>
+    <div class="section-header">
+      Arb Monitor
+      <span class="count" id="arb-count-label"></span>
+    </div>
+    <div id="arb-summary" style="display:flex;gap:32px;padding:16px 20px;border-bottom:1px solid var(--border)">
+      <div><div class="card-label" style="margin-bottom:4px">Detected</div><span id="arb-detected" style="font-size:22px;font-weight:700">—</span></div>
+      <div><div class="card-label" style="margin-bottom:4px">Would Execute</div><span id="arb-dry-run" style="font-size:22px;font-weight:700">—</span></div>
+      <div><div class="card-label" style="margin-bottom:4px">Executed (Live)</div><span id="arb-executed" style="font-size:22px;font-weight:700">—</span></div>
+      <div><div class="card-label" style="margin-bottom:4px">Est. P&amp;L</div><span id="arb-pnl" style="font-size:22px;font-weight:700">—</span></div>
+    </div>
+    <div id="arb-body">
+      <div class="empty">No arb events yet — scanner running in background.</div>
     </div>
   </div>
 
@@ -631,28 +644,51 @@ function renderChart(curve) {
   });
 }
 
-function renderConviction(c) {
-  const el = document.getElementById('conviction-body');
-  if (!c || (!c.high && !c.low)) {
-    el.innerHTML = '<div class="empty">No data yet — trades will appear here once closed.</div>';
+function renderArb(stats, events) {
+  // Summary row
+  document.getElementById('arb-detected').textContent = stats ? stats.detected : '—';
+  document.getElementById('arb-dry-run').textContent = stats ? stats.dry_run : '—';
+
+  const execEl = document.getElementById('arb-executed');
+  execEl.textContent = stats ? stats.executed : '—';
+
+  const pnlEl = document.getElementById('arb-pnl');
+  if (stats) {
+    const p = stats.est_pnl || 0;
+    pnlEl.textContent = (p >= 0 ? '+' : '') + '$' + Math.abs(p).toFixed(2);
+    pnlEl.style.color = p > 0 ? 'var(--green)' : p < 0 ? 'var(--red)' : 'var(--muted)';
+  }
+
+  const countEl = document.getElementById('arb-count-label');
+  if (stats) countEl.textContent = stats.detected + ' total detected';
+
+  // Events table
+  const el = document.getElementById('arb-body');
+  if (!events || !events.length) {
+    el.innerHTML = '<div class="empty">No arb events yet — scanner running in background.</div>';
     return;
   }
+
+  const typeColor = { detected: 'var(--muted)', dry_run: 'var(--yellow)', executed: 'var(--green)', aborted: 'var(--red)' };
+  const typeLabel = { detected: 'THIN', dry_run: 'DRY RUN', executed: 'LIVE', aborted: 'ABORTED' };
+
   let html = '<table><thead><tr>'
-    + '<th>Type</th><th>Trades</th><th>Win Rate</th><th>P&amp;L</th>'
+    + '<th>Time (UTC)</th><th>Type</th><th>YES Ask</th><th>NO Ask</th><th>Total</th><th>Gross</th><th>Est. Profit</th>'
     + '</tr></thead><tbody>';
-  const rows = [
-    { label: 'High Conviction (< 0.46 or > 0.54)', data: c.high, color: 'var(--green)' },
-    { label: 'Low Conviction (0.46 – 0.54)',        data: c.low,  color: 'var(--yellow)' },
-  ];
-  for (const { label, data, color } of rows) {
-    if (!data) continue;
-    const pnlClass = data.pnl > 0 ? 'positive' : data.pnl < 0 ? 'negative' : 'neutral';
-    const wrClass  = data.win_rate >= 55 ? 'positive' : data.win_rate >= 50 ? 'neutral' : 'negative';
+  for (const e of events) {
+    const timeStr = e.event_time ? e.event_time.substring(0, 19).replace('T', ' ') : '—';
+    const color = typeColor[e.event_type] || 'var(--muted)';
+    const label = typeLabel[e.event_type] || e.event_type.toUpperCase();
+    const gross = e.gross_pct != null ? e.gross_pct.toFixed(2) + '%' : '—';
+    const pnl = e.est_pnl != null ? '$' + e.est_pnl.toFixed(3) : '—';
     html += `<tr>
+      <td style="color:var(--muted)">${timeStr}</td>
       <td style="color:${color};font-weight:600">${label}</td>
-      <td>${data.trades}</td>
-      <td class="${wrClass}">${data.win_rate}%&nbsp;<span style="color:var(--muted);font-weight:400">(${data.wins}W / ${data.losses}L)</span></td>
-      <td class="${pnlClass}">${data.pnl >= 0 ? '+' : ''}$${data.pnl.toFixed(2)}</td>
+      <td>${e.yes_ask != null ? e.yes_ask.toFixed(3) : '—'}</td>
+      <td>${e.no_ask  != null ? e.no_ask.toFixed(3)  : '—'}</td>
+      <td>${e.total   != null ? e.total.toFixed(4)   : '—'}</td>
+      <td>${gross}</td>
+      <td>${pnl}</td>
     </tr>`;
   }
   html += '</tbody></table>';
@@ -741,7 +777,7 @@ async function refresh() {
     renderOpen(d.open_positions);
     renderClosed(d.closed_today);
     renderChart(d.pnl_curve);
-    renderConviction(d.conviction_comparison);
+    renderArb(d.arb_stats, d.arb_events);
     renderDailyBreakdown(d.daily_breakdown);
   } catch(e) {
     console.error('refresh error', e);

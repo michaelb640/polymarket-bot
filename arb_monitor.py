@@ -17,6 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from logger import logger
 import config
+import database
 import polymarket
 
 _started = False
@@ -81,6 +82,7 @@ def _check_market(market: dict) -> None:
             f"market={mid[:20]} YES@{yes_ask:.3f} NO@{no_ask:.3f} "
             f"total={total:.4f} gross={gross_pct:.2f}% net≈{net_pct:.2f}%"
         )
+        database.insert_arb_event("detected", mid, yes_ask, no_ask, total, gross_pct, net_pct)
         return
 
     # Profitable arb — shares sized so total cost = ARB_NOTIONAL
@@ -96,6 +98,7 @@ def _check_market(market: dict) -> None:
     if config.DRY_RUN:
         with _lock:
             _stats["dry_run_logged"] += 1
+        database.insert_arb_event("dry_run", mid, yes_ask, no_ask, total, gross_pct, net_pct, shares, est_net)
         logger.info(
             f"[DRY_RUN] ARB would execute: {shares:.2f}sh "
             f"(YES@{yes_ask:.3f} + NO@{no_ask:.3f}) est_profit=${est_net:.3f}"
@@ -132,6 +135,13 @@ def _execute_arb(
         with _lock:
             _stats["executed"] += 1
             _stats["net_pnl"] += est_net
+        database.insert_arb_event(
+            "executed", market_id, yes_ask, no_ask,
+            yes_ask + no_ask,
+            (1.0 - (yes_ask + no_ask)) / (yes_ask + no_ask) * 100,
+            (1.0 - (yes_ask + no_ask)) / (yes_ask + no_ask) * 100 - _TAKER_FEE * 100,
+            shares, est_net,
+        )
         logger.info(
             f"ARB FILLED: market={market_id[:20]} shares={shares:.2f} "
             f"YES@{yes_ask:.3f} NO@{no_ask:.3f} est_net=${est_net:.3f} "
@@ -144,6 +154,10 @@ def _execute_arb(
                 oid = _extract_order_id(resp)
                 if oid:
                     polymarket.cancel_order(oid)
+        database.insert_arb_event(
+            "aborted", market_id, yes_ask, no_ask, yes_ask + no_ask,
+            (1.0 - (yes_ask + no_ask)) / (yes_ask + no_ask) * 100, 0.0,
+        )
         logger.warning(
             f"ARB aborted — one leg failed: "
             f"yes_placed={bool(yes_order)} no_placed={bool(no_order)}"

@@ -65,6 +65,21 @@ def init_db() -> None:
                 fees_paid REAL NOT NULL DEFAULT 0.0
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS arb_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_time TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                market_id TEXT,
+                yes_ask REAL,
+                no_ask REAL,
+                total REAL,
+                gross_pct REAL,
+                net_pct REAL,
+                shares REAL,
+                est_pnl REAL
+            )
+        """)
         conn.commit()
     logger.debug("Database initialized.")
 
@@ -177,3 +192,53 @@ def market_has_open_position(market_id: str) -> bool:
             (market_id,),
         ).fetchone()
     return row["cnt"] > 0
+
+
+def insert_arb_event(
+    event_type: str,
+    market_id: str,
+    yes_ask: float,
+    no_ask: float,
+    total: float,
+    gross_pct: float,
+    net_pct: float,
+    shares: float | None = None,
+    est_pnl: float | None = None,
+) -> None:
+    """Record an arb scanner event (detected / dry_run / executed / aborted)."""
+    event_time = datetime.utcnow().isoformat()
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO arb_events
+               (event_time, event_type, market_id, yes_ask, no_ask, total, gross_pct, net_pct, shares, est_pnl)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (event_time, event_type, market_id, yes_ask, no_ask, total,
+             gross_pct, net_pct, shares, est_pnl),
+        )
+        conn.commit()
+
+
+def get_arb_stats() -> dict:
+    """Summary counts and estimated P&L for the arb monitor."""
+    with _connect() as conn:
+        detected = conn.execute(
+            "SELECT COUNT(*) as cnt FROM arb_events WHERE event_type IN ('detected','dry_run','executed')"
+        ).fetchone()
+        executed = conn.execute(
+            "SELECT COUNT(*) as cnt, COALESCE(SUM(est_pnl),0) as pnl "
+            "FROM arb_events WHERE event_type IN ('executed','dry_run')"
+        ).fetchone()
+    return {
+        "detected": detected["cnt"] if detected else 0,
+        "executed": executed["cnt"] if executed else 0,
+        "est_pnl": round(float(executed["pnl"]), 4) if executed else 0.0,
+    }
+
+
+def get_arb_events(limit: int = 30) -> list[dict]:
+    """Return the most recent arb events for the dashboard."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM arb_events ORDER BY event_time DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
