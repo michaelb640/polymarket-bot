@@ -1,10 +1,17 @@
 import json
 import time
 import requests
+from requests.adapters import HTTPAdapter
 from logger import logger
 import config
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+
+# Persistent HTTP session — reuses TCP/TLS connections across all Gamma API
+# calls, saving ~50-100ms per request vs creating a new connection each time.
+_session = requests.Session()
+_session.mount("https://", HTTPAdapter(pool_connections=10, pool_maxsize=20))
+_session.headers.update({"Connection": "keep-alive"})
 
 try:
     from py_clob_client.client import ClobClient
@@ -77,7 +84,7 @@ def _gamma_fetch_window(window_start_ts: int) -> dict | None:
     """
     slug = f"btc-updown-5m-{window_start_ts}"
     try:
-        r = requests.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=8)
+        r = _session.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=8)
         r.raise_for_status()
         events = r.json()
         if not events:
@@ -301,7 +308,7 @@ def _gamma_fetch_resolved(window_start_ts: int) -> dict | None:
     """
     slug = f"btc-updown-5m-{window_start_ts}"
     try:
-        r = requests.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=8)
+        r = _session.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=8)
         r.raise_for_status()
         events = r.json()
         if not events:

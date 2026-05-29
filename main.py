@@ -339,18 +339,22 @@ def run_bot() -> None:
             # Re-fetch after resolution updates
             open_positions = database.get_open_positions()
 
-            # Generate base signal (without opening price — used as a fast pre-filter)
-            last_signal, _ = strategy.generate_signal(prices, hourly_trend=hourly_trend, realized_vol=daily_vol)
+            # Signal-bot kill switch (Phase 1 prep for arb-only)
+            if config.DISABLE_SIGNAL_BOT:
+                last_signal = "DISABLED"
+            else:
+                # Generate base signal (without opening price — used as a fast pre-filter)
+                last_signal, _ = strategy.generate_signal(prices, hourly_trend=hourly_trend, realized_vol=daily_vol)
 
-            # Weekend block: no new entries Fri/Sat/Sun (Pacific time)
-            if today.weekday() in _WEEKEND_DAYS:
-                last_signal = "WEEKEND"
+                # Weekend block: no new entries Fri/Sat/Sun (Pacific time)
+                if today.weekday() in _WEEKEND_DAYS:
+                    last_signal = "WEEKEND"
 
-            # Manage pending maker orders (check fills, cancel on reversal/expiry)
-            daily_trades = _manage_pending_orders(last_signal, daily_trades)
+                # Manage pending maker orders (check fills, cancel on reversal/expiry)
+                daily_trades = _manage_pending_orders(last_signal, daily_trades)
 
             # Entry logic
-            if last_signal not in ("SKIP", "WEEKEND"):
+            if last_signal not in ("SKIP", "WEEKEND", "DISABLED"):
                 active_markets = polymarket.get_active_btc_markets()
                 now = time.time()
 

@@ -60,4 +60,9 @@ USE_MAKER_ORDERS: bool = _bool("USE_MAKER_ORDERS", True)
 ARB_NOTIONAL: float = _float("ARB_NOTIONAL", 20.0)         # $ per arb (split equally across both legs)
 ARB_EXECUTE_THRESHOLD: float = _float("ARB_EXECUTE_THRESHOLD", 0.97)  # execute only if YES_ask + NO_ask < this
 ARB_LOG_THRESHOLD: float = _float("ARB_LOG_THRESHOLD", 0.985)         # log (but don't execute) below this
-ARB_POLL_SECONDS: int = _int("ARB_POLL_SECONDS", 5)                   # scan frequency in seconds
+ARB_POLL_SECONDS: float = _float("ARB_POLL_SECONDS", 1.0)             # scan frequency in seconds (Phase 1: 5→1)
+
+# Kill switch: disable signal-based trading entirely (Phase 1 prep for arb-only).
+# When True, main.py loop still runs resolution checks but stops generating signals,
+# placing maker orders, or managing pending orders. Arb scanner is unaffected.
+DISABLE_SIGNAL_BOT: bool = _bool("DISABLE_SIGNAL_BOT", False)

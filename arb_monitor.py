@@ -28,9 +28,14 @@ _stats: dict = {
     "executed": 0,       # trades placed (live mode only)
     "dry_run_logged": 0, # would-have-executed in DRY_RUN
     "net_pnl": 0.0,      # estimated realised P&L (live mode)
+    # Phase 1 latency tracking (rolling avg over last N scans)
+    "last_scan_ms": 0.0,
+    "avg_scan_ms": 0.0,
+    "last_execute_ms": 0.0,  # detection → orders sent
 }
 
 _TAKER_FEE = 0.0156  # Polymarket taker fee rate
+_SCAN_TIMES_BUFFER: list[float] = []  # rolling buffer of last 100 scan durations
 
 
 def get_stats() -> dict:
@@ -58,8 +63,10 @@ def _check_market(market: dict) -> None:
     if not yes_id or not no_id:
         return
 
+    book_fetch_start = time.perf_counter()
     _, yes_ask = polymarket.get_token_spread(yes_id)
     _, no_ask = polymarket.get_token_spread(no_id)
+    book_fetch_ms = (time.perf_counter() - book_fetch_start) * 1000
     if yes_ask is None or no_ask is None:
         return
 
@@ -101,11 +108,17 @@ def _check_market(market: dict) -> None:
         database.insert_arb_event("dry_run", mid, yes_ask, no_ask, total, gross_pct, net_pct, shares, est_net)
         logger.info(
             f"[DRY_RUN] ARB would execute: {shares:.2f}sh "
-            f"(YES@{yes_ask:.3f} + NO@{no_ask:.3f}) est_profit=${est_net:.3f}"
+            f"(YES@{yes_ask:.3f} + NO@{no_ask:.3f}) est_profit=${est_net:.3f} "
+            f"book_fetch={book_fetch_ms:.0f}ms"
         )
         return
 
+    exec_start = time.perf_counter()
     _execute_arb(mid, yes_id, no_id, yes_ask, no_ask, shares, est_net)
+    exec_ms = (time.perf_counter() - exec_start) * 1000
+    with _lock:
+        _stats["last_execute_ms"] = round(exec_ms, 1)
+    logger.info(f"ARB latency: book_fetch={book_fetch_ms:.0f}ms execute={exec_ms:.0f}ms")
 
 
 def _execute_arb(
@@ -166,27 +179,42 @@ def _execute_arb(
 
 def _arb_loop() -> None:
     scan_count = 0
+    # Log summary every N scans — Phase 1: 5min / 1s poll = 300 scans
+    summary_every = max(1, int(300 / max(config.ARB_POLL_SECONDS, 0.1)))
     while True:
+        scan_start = time.perf_counter()
         try:
             markets = polymarket.get_active_btc_markets()
             scan_count += 1
-            with _lock:
-                _stats["scans"] = scan_count
 
             for market in markets:
                 _check_market(market)
 
-            if scan_count % 60 == 0:  # log summary every 5 minutes
+            scan_ms = (time.perf_counter() - scan_start) * 1000
+            _SCAN_TIMES_BUFFER.append(scan_ms)
+            if len(_SCAN_TIMES_BUFFER) > 100:
+                _SCAN_TIMES_BUFFER.pop(0)
+            avg = sum(_SCAN_TIMES_BUFFER) / len(_SCAN_TIMES_BUFFER)
+
+            with _lock:
+                _stats["scans"] = scan_count
+                _stats["last_scan_ms"] = round(scan_ms, 1)
+                _stats["avg_scan_ms"] = round(avg, 1)
+
+            if scan_count % summary_every == 0:  # periodic summary
                 s = get_stats()
                 logger.info(
                     f"Arb monitor stats — scans={s['scans']} detected={s['detected']} "
                     f"executed={s['executed']} dry_run_logged={s['dry_run_logged']} "
-                    f"net_pnl=${s['net_pnl']:.2f}"
+                    f"net_pnl=${s['net_pnl']:.2f} "
+                    f"avg_scan={s['avg_scan_ms']:.0f}ms last_execute={s['last_execute_ms']:.0f}ms"
                 )
         except Exception as e:
             logger.error(f"Arb monitor loop error: {e}")
 
-        time.sleep(config.ARB_POLL_SECONDS)
+        # Adaptive sleep: subtract scan time from poll interval (target true cadence)
+        elapsed = time.perf_counter() - scan_start
+        time.sleep(max(0.05, config.ARB_POLL_SECONDS - elapsed))
 
 
 def start_arb_monitor() -> None:
