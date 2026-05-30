@@ -10,7 +10,7 @@ from datetime import datetime, timezone, date, timedelta
 from zoneinfo import ZoneInfo
 
 _PACIFIC = ZoneInfo("America/Los_Angeles")
-_WEEKEND_DAYS = frozenset({4, 5, 6})  # Fri=4, Sat=5, Sun=6 — no new entries
+_WEEKEND_DAYS = frozenset()  # weekend block disabled for data collection
 
 import config
 import database
