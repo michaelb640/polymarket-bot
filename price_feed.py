@@ -126,3 +126,27 @@ def get_btc_data() -> tuple[float | None, float]:
         price = _price_buffer[-1] if _price_buffer else None
 
     return price, _vol_cache["volatility"]
+
+
+def get_realized_vol_per_sec(window_seconds: int = 60) -> float:
+    """
+    Realized volatility per second from the recent price buffer.
+    Each buffer sample is 10s apart; uses the last window_seconds of data.
+    Falls back to daily vol / sqrt(86400) when buffer is too short.
+    """
+    with _buffer_lock:
+        buf = list(_price_buffer)
+
+    n_samples = max(2, window_seconds // 10)
+    buf = buf[-n_samples:]
+
+    if len(buf) < 2:
+        daily_vol = _vol_cache.get("volatility", 0.02)
+        return daily_vol / math.sqrt(86400)
+
+    log_returns = [math.log(buf[i] / buf[i - 1]) for i in range(1, len(buf))]
+    mean_r = sum(log_returns) / len(log_returns)
+    variance = sum((r - mean_r) ** 2 for r in log_returns) / max(len(log_returns) - 1, 1)
+    vol_per_sample = math.sqrt(max(variance, 0.0))
+    vol_per_sec = vol_per_sample / math.sqrt(10)
+    return max(1e-7, min(0.01, vol_per_sec))

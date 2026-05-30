@@ -98,6 +98,74 @@ def generate_signal(prices: list[float], opening_price: float | None = None,
 
 
 
+# ---------------------------------------------------------------------------
+# CEX latency arbitrage — fair-value signal (Phase A)
+# ---------------------------------------------------------------------------
+
+def _norm_cdf(z: float) -> float:
+    """Standard normal CDF via math.erfc (no external deps)."""
+    return 0.5 * math.erfc(-z / math.sqrt(2))
+
+
+def fair_value_yes(
+    open_price: float,
+    current_price: float,
+    seconds_remaining: float,
+    vol_per_sec: float,
+) -> float:
+    """
+    Probability that BTC closes above open_price given current price and
+    remaining seconds in the window. Uses Black-Scholes-style log-normal model.
+    Returns a value in [0, 1].
+    """
+    if seconds_remaining <= 0 or vol_per_sec <= 1e-9 or open_price <= 0:
+        return 1.0 if current_price >= open_price else 0.0
+    edge = math.log(current_price / open_price)
+    sigma_T = vol_per_sec * math.sqrt(seconds_remaining)
+    return _norm_cdf(edge / sigma_T)
+
+
+def generate_latency_arb_signal(
+    open_price: float,
+    current_price: float,
+    seconds_remaining: float,
+    vol_per_sec: float,
+    polymarket_yes_price: float,
+) -> tuple[str, float]:
+    """
+    CEX latency arb signal: compare our fair value to the Polymarket mid price.
+
+    Returns (signal, edge) where:
+      signal = 'UP'   — market underprices UP token (buy UP)
+               'DOWN' — market overprices UP token, so DOWN is cheap (buy DOWN)
+               'SKIP' — edge below threshold or BTC barely moved
+      edge   = abs(fair_value - polymarket_yes_price)
+    """
+    if not open_price or not current_price or seconds_remaining <= 0:
+        return "SKIP", 0.0
+
+    fv = fair_value_yes(open_price, current_price, seconds_remaining, vol_per_sec)
+    raw_edge = fv - polymarket_yes_price
+    abs_edge = abs(raw_edge)
+
+    log_move = abs(math.log(current_price / open_price)) if open_price > 0 else 0.0
+
+    logger.debug(
+        f"Latency arb: open={open_price:.2f} cur={current_price:.2f} "
+        f"rem={seconds_remaining:.0f}s vol_ps={vol_per_sec:.7f} "
+        f"fv={fv:.4f} mkt={polymarket_yes_price:.4f} edge={raw_edge:+.4f} "
+        f"log_move={log_move:.5f}"
+    )
+
+    if log_move < config.LATENCY_ARB_MIN_EDGE:
+        return "SKIP", abs_edge
+
+    if abs_edge < config.LATENCY_ARB_THRESHOLD:
+        return "SKIP", abs_edge
+
+    return ("UP" if raw_edge > 0 else "DOWN"), abs_edge
+
+
 def get_entry_side(signal: str, market: dict) -> str | None:
     """
     Map signal to the Polymarket outcome name ('UP' or 'DOWN').

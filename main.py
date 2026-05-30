@@ -305,9 +305,9 @@ def run_bot() -> None:
     arb_monitor.start_arb_monitor()
     arb_websocket.start_arb_websocket()
 
-    # Wait for the buffer to fill enough to generate signals
-    logger.info("Warming up price buffer (need 12 samples = ~2 minutes)...")
-    while len(price_feed.get_price_buffer()) < 12:
+    # Wait for enough buffer samples to compute realized vol (need ≥6 = ~60s)
+    logger.info("Warming up price buffer (need 6 samples = ~60s)...")
+    while len(price_feed.get_price_buffer()) < 6:
         time.sleep(10)
     logger.info("Buffer ready.")
 
@@ -327,8 +327,7 @@ def run_bot() -> None:
                 daily_trades = 0
                 last_day = today
 
-            btc_price, daily_vol = price_feed.get_btc_data()
-            prices = price_feed.get_price_buffer()
+            btc_price, _ = price_feed.get_btc_data()
             hourly_trend = price_feed.get_hourly_trend()
 
             # Check resolutions for any open positions
@@ -341,130 +340,155 @@ def run_bot() -> None:
             # Re-fetch after resolution updates
             open_positions = database.get_open_positions()
 
-            # Signal-bot kill switch (Phase 1 prep for arb-only)
+            # Signal-bot kill switch
             if config.DISABLE_SIGNAL_BOT:
                 last_signal = "DISABLED"
             else:
-                # Generate base signal (without opening price — used as a fast pre-filter)
-                last_signal, _ = strategy.generate_signal(prices, hourly_trend=hourly_trend, realized_vol=daily_vol)
-
                 # Weekend block: no new entries Fri/Sat/Sun (Pacific time)
                 if today.weekday() in _WEEKEND_DAYS:
                     last_signal = "WEEKEND"
 
-                # Manage pending maker orders (check fills, cancel on reversal/expiry)
+                # Manage pending maker orders (uses last_signal from previous iteration)
                 daily_trades = _manage_pending_orders(last_signal, daily_trades)
 
-            # Entry logic
-            if last_signal not in ("SKIP", "WEEKEND", "DISABLED"):
-                active_markets = polymarket.get_active_btc_markets()
-                now = time.time()
+                # CEX latency arb entry loop — skip on weekends
+                if last_signal != "WEEKEND" and btc_price is not None:
+                    active_markets = polymarket.get_active_btc_markets()
+                    vol_per_sec = price_feed.get_realized_vol_per_sec(config.LATENCY_ARB_VOL_WINDOW)
+                    now = time.time()
 
-                # Prune stale market entries (older than 10 min) to prevent unbounded growth
-                for stale in [k for k, v in _known_markets.items() if now - v.get("ts", 0) > 600]:
-                    del _known_markets[stale]
+                    # Prune stale market entries (older than 10 min)
+                    for stale in [k for k, v in _known_markets.items() if now - v.get("ts", 0) > 600]:
+                        del _known_markets[stale]
 
-                for market in active_markets:
-                    mid = market["condition_id"]
+                    for market in active_markets:
+                        mid = market["condition_id"]
 
-                    # Record opening price on first sight of this window
-                    is_new = _is_new_market(market, now, btc_price)
-                    age = _seconds_since_market_opened(market, now)
-                    if age > config.ENTRY_WINDOW_SECONDS:
-                        if is_new:
-                            logger.debug(f"Market {mid} already {age:.0f}s old — skipping entry window")
-                        continue
+                        is_new = _is_new_market(market, now, btc_price)
+                        age = _seconds_since_market_opened(market, now)
+                        if age > config.ENTRY_WINDOW_SECONDS:
+                            if is_new:
+                                logger.debug(f"Market {mid} already {age:.0f}s old — skipping entry window")
+                            continue
 
-                    # Treat pending maker orders like open positions for MAX_OPEN_POSITIONS gate
-                    if _pending_orders:
-                        continue
+                        if _pending_orders:
+                            continue
 
-                    if not risk.can_open_position(mid):
-                        continue
+                        if not risk.can_open_position(mid):
+                            continue
 
-                    # Re-score with opening price + hourly trend veto + vol context
-                    opening_price = _get_opening_price(market)
-                    signal, score = strategy.generate_signal(prices, opening_price, hourly_trend, realized_vol=daily_vol)
-                    if signal == "SKIP":
-                        logger.debug(f"Signal filtered to SKIP after opening price/trend context for {mid}")
-                        continue
+                        opening_price = _get_opening_price(market)
+                        if opening_price is None:
+                            continue
 
-                    side = strategy.get_entry_side(signal, market)
-                    if side is None:
-                        continue
+                        seconds_remaining = max(1.0, market.get("window_end_ts", now) - now)
 
-                    token = polymarket.get_token_for_signal(market, signal)
-                    if token is None:
-                        logger.debug(f"No token found for signal={signal} in market {mid}")
-                        continue
+                        # Fetch YES token spread for fair-value comparison
+                        yes_token = polymarket.get_token_for_signal(market, "UP")
+                        if yes_token is None:
+                            logger.debug(f"No YES token for {mid[:16]}")
+                            continue
 
-                    token_id = token.get("token_id", mid)
+                        yes_token_id = yes_token.get("token_id", mid)
+                        yes_bid, yes_ask = polymarket.get_token_spread(yes_token_id)
+                        if yes_bid is None or yes_ask is None or yes_bid >= yes_ask:
+                            logger.debug(f"Incomplete YES orderbook for {mid[:16]}")
+                            continue
 
-                    # Need both sides to calculate mid price; also check spread quality
-                    clob_bid, clob_ask = polymarket.get_token_spread(token_id)
-                    logger.debug(f"Token: bid={clob_bid} ask={clob_ask} gamma={token.get('price')}")
+                        yes_spread = yes_ask - yes_bid
+                        if yes_spread > config.MAX_SPREAD:
+                            logger.debug(f"YES spread {yes_spread:.4f} > MAX_SPREAD — skipping {mid[:16]}")
+                            continue
 
-                    if clob_bid is None or clob_ask is None or clob_bid >= clob_ask:
-                        logger.debug(f"Incomplete orderbook for {mid[:16]}... — skipping")
-                        continue
+                        yes_mid = (yes_bid + yes_ask) / 2
 
-                    spread = clob_ask - clob_bid
-                    if spread > config.MAX_SPREAD:
-                        logger.debug(f"Spread {spread:.4f} > MAX_SPREAD {config.MAX_SPREAD} — skipping {mid}")
-                        continue
+                        signal, edge = strategy.generate_latency_arb_signal(
+                            opening_price, btc_price, seconds_remaining, vol_per_sec, yes_mid
+                        )
+                        last_signal = signal  # carry forward for next iteration's reversal check
 
-                    if config.USE_MAKER_ORDERS:
-                        entry_price = round((clob_bid + clob_ask) / 2, 2)
-                    else:
-                        entry_price = clob_ask
+                        if signal == "SKIP":
+                            continue
 
-                    if entry_price < config.MIN_ENTRY_PRICE:
-                        logger.debug(f"Entry price {entry_price:.4f} < MIN_ENTRY_PRICE {config.MIN_ENTRY_PRICE} — skipping")
-                        continue
+                        side = strategy.get_entry_side(signal, market)
+                        if side is None:
+                            continue
 
-                    if entry_price > config.MAX_ENTRY_PRICE:
-                        logger.debug(f"Entry price {entry_price:.4f} > MAX_ENTRY_PRICE {config.MAX_ENTRY_PRICE} — skipping")
-                        continue
-
-                    # Risk-based sizing: target risk_pct of balance as max loss per trade.
-                    # position_size (shares) = risk_dollars / entry_price so cost = risk_dollars.
-                    score_risk = {2: 0.03, 3: 0.05, 4: 0.08}
-                    balance = database.get_account_balance(config.STARTING_BALANCE)
-                    risk_dollars = balance * score_risk.get(score, 0.03)
-                    position_size = round(max(2.0, risk_dollars / entry_price), 2)
-
-                    order = polymarket.place_order(mid, token_id, side, position_size, entry_price)
-                    if order:
-                        if config.USE_MAKER_ORDERS:
-                            # Maker: track pending — only record in DB after fill confirmed
-                            order_id = _extract_order_id(order) or f"mock_{int(time.time())}"
-                            _pending_orders[mid] = {
-                                "order_id": order_id,
-                                "signal": signal,
-                                "side": side,
-                                "token_id": token_id,
-                                "size": position_size,
-                                "entry_price": entry_price,
-                                "btc_price": btc_price,
-                                "market_name": market.get("question"),
-                                "window_start_ts": market.get("window_start_ts"),
-                            }
-                            logger.info(
-                                f"Maker order posted: market={mid} side={side} price={entry_price:.4f} "
-                                f"size={position_size:.2f}sh (${risk_dollars:.2f} at risk) "
-                                f"score={score} order={order_id[:16]}"
-                            )
+                        # Get bid/ask for the token we're actually buying
+                        if signal == "UP":
+                            token_id = yes_token_id
+                            clob_bid, clob_ask = yes_bid, yes_ask
                         else:
-                            # Taker: record immediately (legacy behaviour)
-                            database.insert_position(mid, side, entry_price, position_size,
-                                                     btc_price, market.get("question"),
-                                                     window_start_ts=market.get("window_start_ts"))
-                            daily_trades += 1
-                            logger.info(
-                                f"Entered (taker): market={mid} side={side} price={entry_price:.4f} "
-                                f"size={position_size:.2f}sh (${risk_dollars:.2f} at risk) "
-                                f"score={score} balance=${balance:.2f}"
-                            )
+                            no_token = polymarket.get_token_for_signal(market, "DOWN")
+                            if no_token is None:
+                                logger.debug(f"No DOWN token for {mid[:16]}")
+                                continue
+                            token_id = no_token.get("token_id", mid)
+                            clob_bid, clob_ask = polymarket.get_token_spread(token_id)
+                            if clob_bid is None or clob_ask is None or clob_bid >= clob_ask:
+                                logger.debug(f"Incomplete DOWN orderbook for {mid[:16]}")
+                                continue
+                            no_spread = clob_ask - clob_bid
+                            if no_spread > config.MAX_SPREAD:
+                                logger.debug(f"DOWN spread {no_spread:.4f} > MAX_SPREAD — skipping {mid[:16]}")
+                                continue
+
+                        if config.USE_MAKER_ORDERS:
+                            entry_price = round((clob_bid + clob_ask) / 2, 2)
+                        else:
+                            entry_price = clob_ask
+
+                        if entry_price < config.MIN_ENTRY_PRICE:
+                            logger.debug(f"Entry price {entry_price:.4f} < MIN_ENTRY_PRICE — skipping")
+                            continue
+
+                        if entry_price > config.MAX_ENTRY_PRICE:
+                            logger.debug(f"Entry price {entry_price:.4f} > MAX_ENTRY_PRICE — skipping")
+                            continue
+
+                        # Map edge magnitude to score for risk sizing
+                        if edge >= 0.12:
+                            score = 4
+                        elif edge >= 0.08:
+                            score = 3
+                        else:
+                            score = 2
+
+                        score_risk = {2: 0.03, 3: 0.05, 4: 0.08}
+                        balance = database.get_account_balance(config.STARTING_BALANCE)
+                        risk_dollars = balance * score_risk.get(score, 0.03)
+                        position_size = round(max(2.0, risk_dollars / entry_price), 2)
+
+                        order = polymarket.place_order(mid, token_id, side, position_size, entry_price)
+                        if order:
+                            if config.USE_MAKER_ORDERS:
+                                order_id = _extract_order_id(order) or f"mock_{int(time.time())}"
+                                _pending_orders[mid] = {
+                                    "order_id": order_id,
+                                    "signal": signal,
+                                    "side": side,
+                                    "token_id": token_id,
+                                    "size": position_size,
+                                    "entry_price": entry_price,
+                                    "btc_price": btc_price,
+                                    "market_name": market.get("question"),
+                                    "window_start_ts": market.get("window_start_ts"),
+                                }
+                                logger.info(
+                                    f"Maker order posted: market={mid} side={side} price={entry_price:.4f} "
+                                    f"size={position_size:.2f}sh (${risk_dollars:.2f} at risk) "
+                                    f"edge={edge:.4f} order={order_id[:16]}"
+                                )
+                            else:
+                                database.insert_position(mid, side, entry_price, position_size,
+                                                         btc_price, market.get("question"),
+                                                         window_start_ts=market.get("window_start_ts"))
+                                daily_trades += 1
+                                logger.info(
+                                    f"Entered (taker): market={mid} side={side} price={entry_price:.4f} "
+                                    f"size={position_size:.2f}sh (${risk_dollars:.2f} at risk) "
+                                    f"edge={edge:.4f} balance=${balance:.2f}"
+                                )
 
             open_positions = database.get_open_positions()
             daily_pnl = database.get_daily_pnl()

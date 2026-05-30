@@ -75,3 +75,11 @@ ARB_POLL_SECONDS: float = _float("ARB_POLL_SECONDS", 1.0)             # scan fre
 # When True, main.py loop still runs resolution checks but stops generating signals,
 # placing maker orders, or managing pending orders. Arb scanner is unaffected.
 DISABLE_SIGNAL_BOT: bool = _bool("DISABLE_SIGNAL_BOT", False)
+
+# CEX latency arbitrage (Phase A) — fair-value signal thresholds
+# LATENCY_ARB_THRESHOLD: min |fair_value - market_price| to trigger entry (e.g. 0.06 = 6 cents)
+# LATENCY_ARB_MIN_EDGE: min |ln(current_btc/open_btc)| to filter noise (0.0003 ≈ 0.03% BTC move)
+# LATENCY_ARB_VOL_WINDOW: seconds of price history for realized-vol calculation
+LATENCY_ARB_THRESHOLD: float = _float("LATENCY_ARB_THRESHOLD", 0.06)
+LATENCY_ARB_MIN_EDGE: float = _float("LATENCY_ARB_MIN_EDGE", 0.0003)
+LATENCY_ARB_VOL_WINDOW: int = _int("LATENCY_ARB_VOL_WINDOW", 60)
