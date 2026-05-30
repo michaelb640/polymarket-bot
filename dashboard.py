@@ -130,6 +130,31 @@ def api_stats():
     except Exception:
         pass  # table doesn't exist yet on older DB
 
+    # Roll arb P&L into the main balance cards
+    arb_pnl_total = 0.0
+    arb_pnl_today = 0.0
+    arb_trades_today = 0
+    arb_wins_today = 0
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(est_pnl),0) as t FROM arb_events "
+                "WHERE event_type IN ('executed','dry_run')"
+            ).fetchone()
+            arb_pnl_total = float(row["t"]) if row else 0.0
+
+            row = conn.execute(
+                "SELECT COALESCE(SUM(est_pnl),0) as t, COUNT(*) as cnt FROM arb_events "
+                "WHERE event_type IN ('executed','dry_run') AND event_time >= ? AND event_time < ?",
+                (start_utc, end_utc),
+            ).fetchone()
+            if row:
+                arb_pnl_today = float(row["t"])
+                arb_trades_today = int(row["cnt"])
+                arb_wins_today = arb_trades_today  # arbs are deterministic — every fill is a win
+    except Exception:
+        pass
+
     open_positions = [dict(r) for r in open_rows]
     for p in open_positions:
         p["age"] = _age(p["entry_time"])
@@ -137,11 +162,17 @@ def api_stats():
     closed_list = [dict(r) for r in closed_today]
     all_closed_list = [dict(r) for r in all_closed]
 
-    total_today = len(closed_list)
-    winners_today = sum(1 for t in closed_list if (t["pnl"] or 0) > 0)
+    signal_trades_today = len(closed_list)
+    signal_winners_today = sum(1 for t in closed_list if (t["pnl"] or 0) > 0)
+    total_today = signal_trades_today + arb_trades_today
+    winners_today = signal_winners_today + arb_wins_today
     win_rate = round(winners_today / total_today * 100, 1) if total_today else 0.0
-    daily_pnl = round(daily_pnl_row["total"], 4) if daily_pnl_row else 0.0
-    total_pnl = round(total_pnl_row["total"], 4) if total_pnl_row else 0.0
+
+    signal_daily_pnl = round(daily_pnl_row["total"], 4) if daily_pnl_row else 0.0
+    daily_pnl = round(signal_daily_pnl + arb_pnl_today, 4)
+
+    signal_total_pnl = round(total_pnl_row["total"], 4) if total_pnl_row else 0.0
+    total_pnl = round(signal_total_pnl + arb_pnl_total, 4)
     account_balance = round(STARTING_BALANCE + total_pnl, 2)
 
     # P&L curve + intraday drawdown for today
