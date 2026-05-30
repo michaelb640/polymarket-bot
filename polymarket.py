@@ -164,6 +164,38 @@ def get_token_spread(token_id: str) -> tuple[float | None, float | None]:
         return None, None
 
 
+def get_ask_depth(token_id: str, max_price: float) -> tuple[float | None, float]:
+    """
+    Return (best_ask_price, cumulative_size_at_or_below_max_price).
+    Used to verify there's enough liquidity to fill an arb order without
+    walking the book past the price we expected.
+    Returns (None, 0.0) on error.
+    """
+    client = _get_read_client()
+    if client is None:
+        return None, 0.0
+    try:
+        book = client.get_order_book(token_id)
+        asks = book.asks or []
+        priced: list[tuple[float, float]] = []
+        for a in asks:
+            try:
+                p = float(a["price"] if isinstance(a, dict) else a.price)
+                s = float(a["size"] if isinstance(a, dict) else a.size)
+                priced.append((p, s))
+            except (KeyError, AttributeError, TypeError, ValueError):
+                continue
+        if not priced:
+            return None, 0.0
+        priced.sort(key=lambda x: x[0])
+        best = priced[0][0]
+        depth = sum(s for p, s in priced if p <= max_price + 1e-9)
+        return best, depth
+    except Exception as e:
+        logger.error(f"CLOB depth fetch failed for {token_id[:16]}...: {e}")
+        return None, 0.0
+
+
 def get_token_best_ask(token_id: str) -> float | None:
     """
     Fetch the real best-ask price from the CLOB orderbook for a specific token.

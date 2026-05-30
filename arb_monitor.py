@@ -20,6 +20,77 @@ import config
 import database
 import polymarket
 
+# In-flight capital tracking — each entry: {"amount": float, "release_ts": float}
+# An arb ties up capital until the market resolves (~5 min after window close).
+_deployed: list[dict] = []
+_deployed_lock = threading.Lock()
+
+
+def _current_deployed() -> float:
+    """Sum of currently in-flight arb capital (auto-prunes expired entries)."""
+    now = time.time()
+    with _deployed_lock:
+        _deployed[:] = [d for d in _deployed if d["release_ts"] > now]
+        return sum(d["amount"] for d in _deployed)
+
+
+def _reserve_capital(amount: float, release_ts: float) -> None:
+    with _deployed_lock:
+        _deployed.append({"amount": amount, "release_ts": release_ts})
+
+
+def _calculate_sizing(
+    market_id: str,
+    yes_id: str,
+    no_id: str,
+    yes_ask: float,
+    no_ask: float,
+) -> tuple[float, float, str | None]:
+    """
+    Determine per-arb notional and share count.
+    Returns (shares, notional, reject_reason).
+    reject_reason is None if we should proceed; otherwise it's a string for logs.
+    """
+    total = yes_ask + no_ask
+    balance = database.get_account_balance(config.STARTING_BALANCE)
+
+    # 1) Target notional from balance × pct (with legacy fallback)
+    if config.ARB_NOTIONAL_PCT > 0:
+        target = balance * config.ARB_NOTIONAL_PCT
+    else:
+        target = config.ARB_NOTIONAL
+
+    # 2) Clamp to absolute floor/ceiling
+    notional = max(config.ARB_MIN_NOTIONAL, min(config.ARB_MAX_NOTIONAL, target))
+
+    # 3) Concurrent capital cap — don't blow past MAX_DEPLOYED_PCT of balance
+    cap = balance * config.ARB_MAX_DEPLOYED_PCT
+    deployed = _current_deployed()
+    headroom = cap - deployed
+    if headroom < config.ARB_MIN_NOTIONAL:
+        return 0, 0, f"capital_cap_hit (deployed=${deployed:.2f}/${cap:.2f})"
+    if notional > headroom:
+        notional = headroom
+
+    planned_shares = notional / total
+
+    # 4) Liquidity check — fetch real book depth on both sides, take the smaller
+    yes_best, yes_depth = polymarket.get_ask_depth(yes_id, yes_ask + 1e-6)
+    no_best, no_depth = polymarket.get_ask_depth(no_id, no_ask + 1e-6)
+    if yes_best is None or no_best is None:
+        return 0, 0, "depth_fetch_failed"
+    # Don't try to eat the whole top-of-book — leave a safety margin
+    safe_depth = min(yes_depth, no_depth) * config.ARB_LIQUIDITY_SAFETY
+    if safe_depth < 1.0:
+        return 0, 0, f"insufficient_depth (yes={yes_depth:.1f}sh, no={no_depth:.1f}sh)"
+
+    shares = min(planned_shares, safe_depth)
+    final_notional = shares * total
+    if final_notional < config.ARB_MIN_NOTIONAL:
+        return 0, 0, f"sized_below_min (${final_notional:.2f} < ${config.ARB_MIN_NOTIONAL})"
+
+    return round(shares, 2), round(final_notional, 2), None
+
 _started = False
 _lock = threading.Lock()
 _stats: dict = {
@@ -86,29 +157,47 @@ def check_and_execute_arb(
         database.insert_arb_event("detected", market_id, yes_ask, no_ask, total, gross_pct, net_pct)
         return
 
-    shares = round(config.ARB_NOTIONAL / total, 2)
+    # New: dynamic sizing with balance / cap / liquidity checks
+    shares, notional, reject = _calculate_sizing(market_id, yes_id, no_id, yes_ask, no_ask)
+    if reject is not None:
+        logger.info(
+            f"[{source}] ARB skipped — {reject} | market={market_id[:20]} "
+            f"YES@{yes_ask:.3f} NO@{no_ask:.3f} total={total:.4f}"
+        )
+        return
+
     est_net = shares * (1.0 - total) - shares * total * _TAKER_FEE
 
     logger.info(
         f"[{source}] ARB OPPORTUNITY: market={market_id[:20]} "
         f"YES@{yes_ask:.3f} NO@{no_ask:.3f} total={total:.4f} "
         f"gross={gross_pct:.2f}% net≈{net_pct:.2f}% "
-        f"shares={shares:.2f} est_profit=${est_net:.3f}"
+        f"shares={shares:.2f} notional=${notional:.2f} est_profit=${est_net:.3f}"
     )
 
     if config.DRY_RUN:
         with _lock:
             _stats["dry_run_logged"] += 1
         database.insert_arb_event("dry_run", market_id, yes_ask, no_ask, total, gross_pct, net_pct, shares, est_net)
+        # Simulate the capital reservation so the cap is enforced in dry-run too
+        _reserve_capital(notional, time.time() + 360)  # 5 min window + 60s buffer
         logger.info(
             f"[{source}][DRY_RUN] ARB would execute: {shares:.2f}sh "
-            f"est_profit=${est_net:.3f} book_fetch={book_fetch_ms:.0f}ms"
+            f"notional=${notional:.2f} est_profit=${est_net:.3f} "
+            f"book_fetch={book_fetch_ms:.0f}ms"
         )
         return
 
+    # Live: reserve capital BEFORE the order goes out, release on failure
+    _reserve_capital(notional, time.time() + 360)
     exec_start = time.perf_counter()
-    _execute_arb(market_id, yes_id, no_id, yes_ask, no_ask, shares, est_net)
+    success = _execute_arb(market_id, yes_id, no_id, yes_ask, no_ask, shares, est_net)
     exec_ms = (time.perf_counter() - exec_start) * 1000
+    if not success:
+        # Roll back the reservation if execution failed
+        with _deployed_lock:
+            if _deployed:
+                _deployed.pop()
     with _lock:
         _stats["last_execute_ms"] = round(exec_ms, 1)
     logger.info(f"[{source}] ARB latency: book_fetch={book_fetch_ms:.0f}ms execute={exec_ms:.0f}ms")
@@ -147,10 +236,11 @@ def _execute_arb(
     no_ask: float,
     shares: float,
     est_net: float,
-) -> None:
+) -> bool:
     """
     Send YES and NO taker orders in parallel. Cancel the surviving leg
     if either order fails to place (prevents naked exposure).
+    Returns True if both legs filled, False otherwise.
     """
     yes_order = no_order = None
     try:
@@ -178,6 +268,7 @@ def _execute_arb(
             f"YES@{yes_ask:.3f} NO@{no_ask:.3f} est_net=${est_net:.3f} "
             f"(total arb pnl=${_stats['net_pnl']:.2f})"
         )
+        return True
     else:
         # Cancel whichever leg placed successfully to avoid naked exposure
         for resp in (yes_order, no_order):
@@ -193,6 +284,7 @@ def _execute_arb(
             f"ARB aborted — one leg failed: "
             f"yes_placed={bool(yes_order)} no_placed={bool(no_order)}"
         )
+        return False
 
 
 def _arb_loop() -> None:
@@ -257,9 +349,15 @@ def start_arb_monitor() -> None:
     t = threading.Thread(target=_arb_loop, daemon=True, name="arb-monitor")
     t.start()
     _started = True
+    if config.ARB_NOTIONAL_PCT > 0:
+        sizing = (f"notional={config.ARB_NOTIONAL_PCT*100:.1f}% of balance "
+                  f"(min=${config.ARB_MIN_NOTIONAL}, max=${config.ARB_MAX_NOTIONAL})")
+    else:
+        sizing = f"notional=${config.ARB_NOTIONAL} (fixed legacy)"
     logger.info(
         f"Arb monitor started — poll={config.ARB_POLL_SECONDS}s "
         f"execute_threshold={config.ARB_EXECUTE_THRESHOLD} "
         f"log_threshold={config.ARB_LOG_THRESHOLD} "
-        f"notional=${config.ARB_NOTIONAL}"
+        f"{sizing} max_deployed={config.ARB_MAX_DEPLOYED_PCT*100:.0f}% "
+        f"liquidity_safety={config.ARB_LIQUIDITY_SAFETY*100:.0f}%"
     )

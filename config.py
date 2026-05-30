@@ -56,8 +56,17 @@ MAX_SPREAD: float = _float("MAX_SPREAD", 0.04)
 # Order execution mode: True = post limit order at mid (maker, 0% fee); False = hit ask (taker, 1.56% fee)
 USE_MAKER_ORDERS: bool = _bool("USE_MAKER_ORDERS", True)
 
-# YES/NO arbitrage scanner
-ARB_NOTIONAL: float = _float("ARB_NOTIONAL", 20.0)         # $ per arb (split equally across both legs)
+# YES/NO arbitrage scanner — sizing
+# Per-arb notional = clamp(balance × ARB_NOTIONAL_PCT, MIN, MAX)
+# Set ARB_NOTIONAL_PCT=0 to fall back to fixed ARB_NOTIONAL (legacy mode)
+ARB_NOTIONAL_PCT: float = _float("ARB_NOTIONAL_PCT", 0.05)       # 5% of balance per arb
+ARB_MIN_NOTIONAL: float = _float("ARB_MIN_NOTIONAL", 5.0)        # never go below $5
+ARB_MAX_NOTIONAL: float = _float("ARB_MAX_NOTIONAL", 200.0)      # never go above $200
+ARB_NOTIONAL: float = _float("ARB_NOTIONAL", 20.0)               # legacy: fixed $ if PCT=0
+ARB_MAX_DEPLOYED_PCT: float = _float("ARB_MAX_DEPLOYED_PCT", 0.50)  # cap on total in-flight capital
+ARB_LIQUIDITY_SAFETY: float = _float("ARB_LIQUIDITY_SAFETY", 0.80)  # only consume 80% of available depth
+
+# YES/NO arbitrage scanner — thresholds and pacing
 ARB_EXECUTE_THRESHOLD: float = _float("ARB_EXECUTE_THRESHOLD", 0.97)  # execute only if YES_ask + NO_ask < this
 ARB_LOG_THRESHOLD: float = _float("ARB_LOG_THRESHOLD", 0.985)         # log (but don't execute) below this
 ARB_POLL_SECONDS: float = _float("ARB_POLL_SECONDS", 1.0)             # scan frequency in seconds (Phase 1: 5→1)
