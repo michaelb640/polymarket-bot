@@ -205,9 +205,9 @@ def get_active_btc_markets() -> list[dict]:
             results.append(market)
 
     if results:
-        logger.info(f"Found {len(results)} active BTC 5-min market(s) via Gamma API.")
+        logger.debug(f"Found {len(results)} active BTC 5-min market(s) via Gamma API.")
     else:
-        logger.info("No active BTC 5-min markets found via Gamma API.")
+        logger.debug("No active BTC 5-min markets found via Gamma API.")
 
     return results
 
