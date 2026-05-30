@@ -62,17 +62,18 @@ def can_open_position(market_id: str) -> bool:
         logger.debug(f"Risk check: in cooldown after losing streak — {remaining}s remaining")
         return False
 
-    # Daily loss limit: stop if today's losses exceed 7.5% of account balance
-    daily_pnl = database.get_daily_pnl()
-    if daily_pnl < 0:
-        balance = database.get_account_balance(config.STARTING_BALANCE)
-        limit = balance * _DAILY_LOSS_LIMIT_PCT
-        if abs(daily_pnl) >= limit:
-            logger.warning(
-                f"Risk check: daily loss ${abs(daily_pnl):.2f} hit {_DAILY_LOSS_LIMIT_PCT*100:.0f}% limit "
-                f"(${limit:.2f} of ${balance:.2f} balance) — stopping for the day"
-            )
-            return False
+    # Daily loss limit — disabled when DAILY_LOSS_LIMIT_PCT=0
+    if _DAILY_LOSS_LIMIT_PCT > 0:
+        daily_pnl = database.get_daily_pnl()
+        if daily_pnl < 0:
+            balance = database.get_account_balance(config.STARTING_BALANCE)
+            limit = balance * _DAILY_LOSS_LIMIT_PCT
+            if abs(daily_pnl) >= limit:
+                logger.warning(
+                    f"Risk check: daily loss ${abs(daily_pnl):.2f} hit {_DAILY_LOSS_LIMIT_PCT*100:.0f}% limit "
+                    f"(${limit:.2f} of ${balance:.2f} balance) — stopping for the day"
+                )
+                return False
 
     if database.market_has_open_position(market_id):
         logger.debug(f"Risk check: already have an open position in market {market_id}")
