@@ -19,6 +19,7 @@ import polymarket
 import strategy
 import risk
 import arb_monitor
+import arb_websocket
 from logger import logger
 
 # ---------------------------------------------------------------------------
@@ -302,6 +303,7 @@ def run_bot() -> None:
     polymarket.cancel_all_open_orders()
     price_feed.start_price_sampler()
     arb_monitor.start_arb_monitor()
+    arb_websocket.start_arb_websocket()
 
     # Wait for the buffer to fill enough to generate signals
     logger.info("Warming up price buffer (need 12 samples = ~2 minutes)...")

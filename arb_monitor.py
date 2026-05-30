@@ -51,8 +51,71 @@ def _extract_order_id(resp: dict) -> str | None:
             or resp.get("id") or resp.get("orderId"))
 
 
+def check_and_execute_arb(
+    market_id: str,
+    yes_id: str,
+    no_id: str,
+    yes_ask: float,
+    no_ask: float,
+    source: str = "rest",
+    book_fetch_ms: float = 0.0,
+) -> None:
+    """
+    Public entry point: given known YES/NO best-ask prices for a market,
+    evaluate the arb threshold and execute if profitable.
+    `source` is just a tag for logs ("rest" or "ws") so we can see
+    which path caught the opportunity.
+    """
+    total = yes_ask + no_ask
+    if total >= config.ARB_LOG_THRESHOLD:
+        return
+
+    gross_pct = (1.0 - total) / total * 100
+    fee_pct = _TAKER_FEE * 100
+    net_pct = gross_pct - fee_pct
+
+    with _lock:
+        _stats["detected"] += 1
+
+    if total >= config.ARB_EXECUTE_THRESHOLD:
+        logger.info(
+            f"[{source}] ARB DETECTED (thin): market={market_id[:20]} "
+            f"YES@{yes_ask:.3f} NO@{no_ask:.3f} total={total:.4f} "
+            f"gross={gross_pct:.2f}% net≈{net_pct:.2f}%"
+        )
+        database.insert_arb_event("detected", market_id, yes_ask, no_ask, total, gross_pct, net_pct)
+        return
+
+    shares = round(config.ARB_NOTIONAL / total, 2)
+    est_net = shares * (1.0 - total) - shares * total * _TAKER_FEE
+
+    logger.info(
+        f"[{source}] ARB OPPORTUNITY: market={market_id[:20]} "
+        f"YES@{yes_ask:.3f} NO@{no_ask:.3f} total={total:.4f} "
+        f"gross={gross_pct:.2f}% net≈{net_pct:.2f}% "
+        f"shares={shares:.2f} est_profit=${est_net:.3f}"
+    )
+
+    if config.DRY_RUN:
+        with _lock:
+            _stats["dry_run_logged"] += 1
+        database.insert_arb_event("dry_run", market_id, yes_ask, no_ask, total, gross_pct, net_pct, shares, est_net)
+        logger.info(
+            f"[{source}][DRY_RUN] ARB would execute: {shares:.2f}sh "
+            f"est_profit=${est_net:.3f} book_fetch={book_fetch_ms:.0f}ms"
+        )
+        return
+
+    exec_start = time.perf_counter()
+    _execute_arb(market_id, yes_id, no_id, yes_ask, no_ask, shares, est_net)
+    exec_ms = (time.perf_counter() - exec_start) * 1000
+    with _lock:
+        _stats["last_execute_ms"] = round(exec_ms, 1)
+    logger.info(f"[{source}] ARB latency: book_fetch={book_fetch_ms:.0f}ms execute={exec_ms:.0f}ms")
+
+
 def _check_market(market: dict) -> None:
-    """Evaluate one market for a YES+NO arb opportunity and act if found."""
+    """REST-driven check: fetch YES/NO order books, then evaluate."""
     yes_token = polymarket.get_token_for_signal(market, "UP")
     no_token = polymarket.get_token_for_signal(market, "DOWN")
     if yes_token is None or no_token is None:
@@ -70,55 +133,10 @@ def _check_market(market: dict) -> None:
     if yes_ask is None or no_ask is None:
         return
 
-    total = yes_ask + no_ask
-    if total >= config.ARB_LOG_THRESHOLD:
-        return
-
-    gross_pct = (1.0 - total) / total * 100
-    fee_pct = _TAKER_FEE * 100
-    net_pct = gross_pct - fee_pct
-    mid = market["condition_id"]
-
-    with _lock:
-        _stats["detected"] += 1
-
-    if total >= config.ARB_EXECUTE_THRESHOLD:
-        # Visible but not worth executing (fees eat the margin)
-        logger.info(
-            f"ARB DETECTED (spread too thin to execute): "
-            f"market={mid[:20]} YES@{yes_ask:.3f} NO@{no_ask:.3f} "
-            f"total={total:.4f} gross={gross_pct:.2f}% net≈{net_pct:.2f}%"
-        )
-        database.insert_arb_event("detected", mid, yes_ask, no_ask, total, gross_pct, net_pct)
-        return
-
-    # Profitable arb — shares sized so total cost = ARB_NOTIONAL
-    shares = round(config.ARB_NOTIONAL / total, 2)
-    est_net = shares * (1.0 - total) - shares * total * _TAKER_FEE
-
-    logger.info(
-        f"ARB OPPORTUNITY: market={mid[:20]} YES@{yes_ask:.3f} NO@{no_ask:.3f} "
-        f"total={total:.4f} gross={gross_pct:.2f}% net≈{net_pct:.2f}% "
-        f"shares={shares:.2f} est_profit=${est_net:.3f}"
+    check_and_execute_arb(
+        market["condition_id"], yes_id, no_id, yes_ask, no_ask,
+        source="rest", book_fetch_ms=book_fetch_ms,
     )
-
-    if config.DRY_RUN:
-        with _lock:
-            _stats["dry_run_logged"] += 1
-        database.insert_arb_event("dry_run", mid, yes_ask, no_ask, total, gross_pct, net_pct, shares, est_net)
-        logger.info(
-            f"[DRY_RUN] ARB would execute: {shares:.2f}sh "
-            f"(YES@{yes_ask:.3f} + NO@{no_ask:.3f}) est_profit=${est_net:.3f} "
-            f"book_fetch={book_fetch_ms:.0f}ms"
-        )
-        return
-
-    exec_start = time.perf_counter()
-    _execute_arb(mid, yes_id, no_id, yes_ask, no_ask, shares, est_net)
-    exec_ms = (time.perf_counter() - exec_start) * 1000
-    with _lock:
-        _stats["last_execute_ms"] = round(exec_ms, 1)
-    logger.info(f"ARB latency: book_fetch={book_fetch_ms:.0f}ms execute={exec_ms:.0f}ms")
 
 
 def _execute_arb(
@@ -203,11 +221,25 @@ def _arb_loop() -> None:
 
             if scan_count % summary_every == 0:  # periodic summary
                 s = get_stats()
+                ws_summary = ""
+                try:
+                    import arb_websocket as _ws
+                    ws_stats = _ws.get_stats()
+                    ws_summary = (
+                        f" | WS: connects={ws_stats['ws_connects']} "
+                        f"disconnects={ws_stats['ws_disconnects']} "
+                        f"msgs={ws_stats['ws_messages']} "
+                        f"triggers={ws_stats['ws_arb_triggers']} "
+                        f"last_trigger={ws_stats['last_ws_arb_ms']:.0f}ms"
+                    )
+                except Exception:
+                    pass
                 logger.info(
                     f"Arb monitor stats — scans={s['scans']} detected={s['detected']} "
                     f"executed={s['executed']} dry_run_logged={s['dry_run_logged']} "
                     f"net_pnl=${s['net_pnl']:.2f} "
                     f"avg_scan={s['avg_scan_ms']:.0f}ms last_execute={s['last_execute_ms']:.0f}ms"
+                    f"{ws_summary}"
                 )
         except Exception as e:
             logger.error(f"Arb monitor loop error: {e}")
