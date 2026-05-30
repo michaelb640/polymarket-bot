@@ -6,10 +6,10 @@ from collections import deque
 import requests
 from logger import logger
 
-BINANCE_PRICE_URL = "https://api.binance.us/api/v3/ticker/price?symbol=BTCUSD"
-BINANCE_KLINES_URL = "https://api.binance.us/api/v3/klines"
-_KLINES_SYMBOL = "BTCUSD"
-_BINANCE_WS_URL = "wss://stream.binance.us:9443/ws/btcusd@aggTrade"
+BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+_KLINES_SYMBOL = "BTCUSDT"
+_BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
 _WS_BACKOFF = [1, 2, 5, 10, 30, 60]
 
 # Rolling 30-sample buffer (10s interval → 5 minutes of data)
