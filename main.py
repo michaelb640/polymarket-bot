@@ -72,10 +72,20 @@ _pending_orders: dict[str, dict] = {}
 
 def _is_new_market(market: dict, now: float, btc_price: float | None) -> bool:
     mid = market["condition_id"]
+    window_start_ts = market.get("window_start_ts", 0)
     if mid not in _known_markets:
-        _known_markets[mid] = {"ts": now, "btc_price": btc_price}
-        logger.info(f"New market window: {mid} opening_price={btc_price}")
+        # Only record opening BTC price after the window has actually started.
+        # If we see the market early (pre-start), store None and fill it in later.
+        opening_btc = btc_price if now >= window_start_ts else None
+        _known_markets[mid] = {"ts": now, "btc_price": opening_btc}
+        logger.info(f"New market window: {mid} opening_price={opening_btc} (started={now >= window_start_ts})")
         return True
+    else:
+        # Fill in opening price on first loop tick after window starts
+        entry = _known_markets[mid]
+        if entry["btc_price"] is None and now >= window_start_ts and btc_price is not None:
+            entry["btc_price"] = btc_price
+            logger.info(f"Opening price recorded for {mid}: ${btc_price:,.2f}")
     return False
 
 
@@ -392,6 +402,11 @@ def run_bot() -> None:
                             continue
 
                         if not risk.can_open_position(mid):
+                            continue
+
+                        # Don't enter before the window has started — opening price not set yet
+                        if market.get("window_start_ts", 0) > now:
+                            logger.debug(f"Market {mid} window starts in {market['window_start_ts'] - now:.0f}s — waiting")
                             continue
 
                         opening_price = _get_opening_price(market)
