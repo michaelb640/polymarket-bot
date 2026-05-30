@@ -112,9 +112,15 @@ def api_stats():
             arb_stats["dry_run"] = row["cnt"] if row else 0
 
             row = conn.execute(
-                "SELECT COUNT(*) as cnt, COALESCE(SUM(est_pnl),0) as pnl FROM arb_events WHERE event_type='executed'"
+                "SELECT COUNT(*) as cnt FROM arb_events WHERE event_type='executed'"
             ).fetchone()
             arb_stats["executed"] = row["cnt"] if row else 0
+
+            # Est. P&L: sum profit from executed (live) + dry_run (would-have).
+            # In DRY_RUN mode this shows the simulated P&L; in live it adds real fills.
+            row = conn.execute(
+                "SELECT COALESCE(SUM(est_pnl),0) as pnl FROM arb_events WHERE event_type IN ('executed','dry_run')"
+            ).fetchone()
             arb_stats["est_pnl"] = round(float(row["pnl"]), 4) if row else 0.0
 
             rows = conn.execute(
