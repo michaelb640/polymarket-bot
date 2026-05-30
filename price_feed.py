@@ -215,13 +215,18 @@ def get_realized_vol_per_sec(window_seconds: int = 60) -> float:
     n_samples = max(2, window_seconds // 10)
     buf = buf[-n_samples:]
 
+    # Daily vol per second — used as a meaningful floor so flat-buffer periods
+    # don't produce a near-zero sigma that inflates z-scores on tiny moves.
+    daily_vol = _vol_cache.get("volatility", 0.02)
+    daily_vol_per_sec = daily_vol / math.sqrt(86400)
+
     if len(buf) < 2:
-        daily_vol = _vol_cache.get("volatility", 0.02)
-        return daily_vol / math.sqrt(86400)
+        return daily_vol_per_sec
 
     log_returns = [math.log(buf[i] / buf[i - 1]) for i in range(1, len(buf))]
     mean_r = sum(log_returns) / len(log_returns)
     variance = sum((r - mean_r) ** 2 for r in log_returns) / max(len(log_returns) - 1, 1)
     vol_per_sample = math.sqrt(max(variance, 0.0))
     vol_per_sec = vol_per_sample / math.sqrt(10)
-    return max(1e-7, min(0.01, vol_per_sec))
+    # Use the higher of short-window vol and daily vol floor — never go below historical baseline
+    return min(0.01, max(vol_per_sec, daily_vol_per_sec))
