@@ -45,11 +45,15 @@ def _calculate_sizing(
     no_id: str,
     yes_ask: float,
     no_ask: float,
-) -> tuple[float, float, str | None]:
+) -> tuple[float, float, float, float, str | None]:
     """
-    Determine per-arb notional and share count.
-    Returns (shares, notional, reject_reason).
-    reject_reason is None if we should proceed; otherwise it's a string for logs.
+    Determine per-arb notional, share count, and REALISTIC fill prices
+    after walking the book.
+
+    Returns (shares, notional, realistic_yes_price, realistic_no_price, reject_reason).
+    realistic_*_price reflects book-walked slippage (top of book is rarely
+    deep enough to absorb our full size, so true fill price is usually
+    worse than the displayed best ask).
     """
     total = yes_ask + no_ask
     balance = database.get_account_balance(config.STARTING_BALANCE)
@@ -68,28 +72,47 @@ def _calculate_sizing(
     deployed = _current_deployed()
     headroom = cap - deployed
     if headroom < config.ARB_MIN_NOTIONAL:
-        return 0, 0, f"capital_cap_hit (deployed=${deployed:.2f}/${cap:.2f})"
+        return 0, 0, 0, 0, f"capital_cap_hit (deployed=${deployed:.2f}/${cap:.2f})"
     if notional > headroom:
         notional = headroom
 
     planned_shares = notional / total
 
-    # 4) Liquidity check — fetch real book depth on both sides, take the smaller
-    yes_best, yes_depth = polymarket.get_ask_depth(yes_id, yes_ask + 1e-6)
-    no_best, no_depth = polymarket.get_ask_depth(no_id, no_ask + 1e-6)
-    if yes_best is None or no_best is None:
-        return 0, 0, "depth_fetch_failed"
-    # Don't try to eat the whole top-of-book — leave a safety margin
-    safe_depth = min(yes_depth, no_depth) * config.ARB_LIQUIDITY_SAFETY
+    # 4) Fetch real ask ladders for both legs (one call each, ~200ms total)
+    yes_ladder = polymarket.get_ask_ladder(yes_id)
+    no_ladder = polymarket.get_ask_ladder(no_id)
+    if not yes_ladder or not no_ladder:
+        return 0, 0, 0, 0, "ladder_fetch_failed"
+
+    # 5) Liquidity safety: cap at min(yes_depth, no_depth) * safety_factor
+    yes_total_depth = sum(s for _, s in yes_ladder)
+    no_total_depth = sum(s for _, s in no_ladder)
+    safe_depth = min(yes_total_depth, no_total_depth) * config.ARB_LIQUIDITY_SAFETY
     if safe_depth < 1.0:
-        return 0, 0, f"insufficient_depth (yes={yes_depth:.1f}sh, no={no_depth:.1f}sh)"
+        return 0, 0, 0, 0, f"insufficient_depth (yes={yes_total_depth:.1f}sh, no={no_total_depth:.1f}sh)"
 
     shares = min(planned_shares, safe_depth)
-    final_notional = shares * total
-    if final_notional < config.ARB_MIN_NOTIONAL:
-        return 0, 0, f"sized_below_min (${final_notional:.2f} < ${config.ARB_MIN_NOTIONAL})"
 
-    return round(shares, 2), round(final_notional, 2), None
+    # 6) SLIPPAGE: walk both ladders to get realistic weighted-avg fill prices
+    real_yes_price, yes_filled = polymarket.walk_ladder(yes_ladder, shares)
+    real_no_price, no_filled = polymarket.walk_ladder(no_ladder, shares)
+    if yes_filled < 1.0 or no_filled < 1.0:
+        return 0, 0, 0, 0, "could_not_walk_book"
+
+    # Use the smaller fill amount as the actual share count
+    shares = min(yes_filled, no_filled)
+    real_total = real_yes_price + real_no_price
+    final_notional = shares * real_total
+    if final_notional < config.ARB_MIN_NOTIONAL:
+        return 0, 0, 0, 0, f"sized_below_min (${final_notional:.2f} < ${config.ARB_MIN_NOTIONAL})"
+
+    return (
+        round(shares, 2),
+        round(final_notional, 2),
+        round(real_yes_price, 4),
+        round(real_no_price, 4),
+        None,
+    )
 
 _started = False
 _lock = threading.Lock()
@@ -157,8 +180,10 @@ def check_and_execute_arb(
         database.insert_arb_event("detected", market_id, yes_ask, no_ask, total, gross_pct, net_pct)
         return
 
-    # New: dynamic sizing with balance / cap / liquidity checks
-    shares, notional, reject = _calculate_sizing(market_id, yes_id, no_id, yes_ask, no_ask)
+    # New: dynamic sizing with balance / cap / liquidity / slippage checks
+    shares, notional, real_yes, real_no, reject = _calculate_sizing(
+        market_id, yes_id, no_id, yes_ask, no_ask
+    )
     if reject is not None:
         logger.info(
             f"[{source}] ARB skipped — {reject} | market={market_id[:20]} "
@@ -166,35 +191,57 @@ def check_and_execute_arb(
         )
         return
 
-    est_net = shares * (1.0 - total) - shares * total * _TAKER_FEE
+    # Two P&L numbers:
+    #   est_net_optimistic — uses displayed best-ask (what dry-run used to show)
+    #   est_net_realistic  — uses book-walked weighted-avg fill (true slippage)
+    est_net_optimistic = shares * (1.0 - total) - shares * total * _TAKER_FEE
+    real_total = real_yes + real_no
+    est_net_realistic = shares * (1.0 - real_total) - shares * real_total * _TAKER_FEE
+    slippage_cost = est_net_optimistic - est_net_realistic
+
+    # If slippage flips the trade to unprofitable, log as skipped
+    if est_net_realistic <= 0:
+        logger.info(
+            f"[{source}] ARB skipped — unprofitable_after_slippage | "
+            f"opt=${est_net_optimistic:.3f} real=${est_net_realistic:.3f} "
+            f"slippage=${slippage_cost:.3f} | market={market_id[:20]} "
+            f"display={total:.4f} fill={real_total:.4f}"
+        )
+        return
 
     logger.info(
         f"[{source}] ARB OPPORTUNITY: market={market_id[:20]} "
-        f"YES@{yes_ask:.3f} NO@{no_ask:.3f} total={total:.4f} "
-        f"gross={gross_pct:.2f}% net≈{net_pct:.2f}% "
-        f"shares={shares:.2f} notional=${notional:.2f} est_profit=${est_net:.3f}"
+        f"display(YES@{yes_ask:.3f}+NO@{no_ask:.3f}={total:.4f}) "
+        f"fill(YES@{real_yes:.3f}+NO@{real_no:.3f}={real_total:.4f}) "
+        f"shares={shares:.2f} notional=${notional:.2f} "
+        f"est_profit: opt=${est_net_optimistic:.3f} real=${est_net_realistic:.3f} "
+        f"(slippage=${slippage_cost:.3f})"
     )
 
     if config.DRY_RUN:
         with _lock:
             _stats["dry_run_logged"] += 1
-        database.insert_arb_event("dry_run", market_id, yes_ask, no_ask, total, gross_pct, net_pct, shares, est_net)
-        # Simulate the capital reservation so the cap is enforced in dry-run too
-        _reserve_capital(notional, time.time() + 360)  # 5 min window + 60s buffer
+        # Store the REALISTIC est_pnl so dashboard reflects post-slippage reality
+        database.insert_arb_event(
+            "dry_run", market_id, real_yes, real_no, real_total,
+            (1.0 - real_total) / real_total * 100,
+            (1.0 - real_total) / real_total * 100 - _TAKER_FEE * 100,
+            shares, est_net_realistic,
+        )
+        _reserve_capital(notional, time.time() + 360)
         logger.info(
             f"[{source}][DRY_RUN] ARB would execute: {shares:.2f}sh "
-            f"notional=${notional:.2f} est_profit=${est_net:.3f} "
+            f"notional=${notional:.2f} est_realistic=${est_net_realistic:.3f} "
             f"book_fetch={book_fetch_ms:.0f}ms"
         )
         return
 
-    # Live: reserve capital BEFORE the order goes out, release on failure
+    # Live: reserve capital, then execute at realistic prices
     _reserve_capital(notional, time.time() + 360)
     exec_start = time.perf_counter()
-    success = _execute_arb(market_id, yes_id, no_id, yes_ask, no_ask, shares, est_net)
+    success = _execute_arb(market_id, yes_id, no_id, real_yes, real_no, shares, est_net_realistic)
     exec_ms = (time.perf_counter() - exec_start) * 1000
     if not success:
-        # Roll back the reservation if execution failed
         with _deployed_lock:
             if _deployed:
                 _deployed.pop()

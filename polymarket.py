@@ -164,36 +164,71 @@ def get_token_spread(token_id: str) -> tuple[float | None, float | None]:
         return None, None
 
 
-def get_ask_depth(token_id: str, max_price: float) -> tuple[float | None, float]:
+def get_ask_ladder(token_id: str) -> list[tuple[float, float]]:
     """
-    Return (best_ask_price, cumulative_size_at_or_below_max_price).
-    Used to verify there's enough liquidity to fill an arb order without
-    walking the book past the price we expected.
-    Returns (None, 0.0) on error.
+    Return the full ask side of the book as a sorted list of (price, size)
+    tuples (cheapest first). Empty list on error or missing book.
+    Used both for slippage simulation (walking the book) and for the
+    liquidity safety check.
     """
     client = _get_read_client()
     if client is None:
-        return None, 0.0
+        return []
     try:
         book = client.get_order_book(token_id)
         asks = book.asks or []
-        priced: list[tuple[float, float]] = []
+        ladder: list[tuple[float, float]] = []
         for a in asks:
             try:
                 p = float(a["price"] if isinstance(a, dict) else a.price)
                 s = float(a["size"] if isinstance(a, dict) else a.size)
-                priced.append((p, s))
+                if s > 0:
+                    ladder.append((p, s))
             except (KeyError, AttributeError, TypeError, ValueError):
                 continue
-        if not priced:
-            return None, 0.0
-        priced.sort(key=lambda x: x[0])
-        best = priced[0][0]
-        depth = sum(s for p, s in priced if p <= max_price + 1e-9)
-        return best, depth
+        ladder.sort(key=lambda x: x[0])
+        return ladder
     except Exception as e:
-        logger.error(f"CLOB depth fetch failed for {token_id[:16]}...: {e}")
+        logger.error(f"CLOB ladder fetch failed for {token_id[:16]}...: {e}")
+        return []
+
+
+def get_ask_depth(token_id: str, max_price: float) -> tuple[float | None, float]:
+    """
+    Return (best_ask_price, cumulative_size_at_or_below_max_price).
+    Convenience wrapper over get_ask_ladder for callers that only need
+    the totals.
+    """
+    ladder = get_ask_ladder(token_id)
+    if not ladder:
         return None, 0.0
+    best = ladder[0][0]
+    depth = sum(s for p, s in ladder if p <= max_price + 1e-9)
+    return best, depth
+
+
+def walk_ladder(ladder: list[tuple[float, float]], target_shares: float) -> tuple[float, float]:
+    """
+    Walk an ask ladder to fill `target_shares` and return
+    (weighted_avg_price, shares_actually_filled).
+    If the book is too thin, fills as much as possible at increasing prices.
+    Returns (0.0, 0.0) if ladder is empty.
+    """
+    if not ladder or target_shares <= 0:
+        return 0.0, 0.0
+    filled = 0.0
+    cost = 0.0
+    remaining = target_shares
+    for price, size in ladder:
+        if remaining <= 0:
+            break
+        take = min(size, remaining)
+        cost += take * price
+        filled += take
+        remaining -= take
+    if filled == 0:
+        return 0.0, 0.0
+    return cost / filled, filled
 
 
 def get_token_best_ask(token_id: str) -> float | None:
