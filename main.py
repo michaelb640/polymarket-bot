@@ -296,12 +296,17 @@ def print_status_table(
 # Main loop
 # ---------------------------------------------------------------------------
 
+_ENTRY_POLL_SECONDS = 5   # fast entry-check cadence
+_MGMT_POLL_SECONDS = 30  # slower cadence for resolutions, display, order management
+
+
 def run_bot() -> None:
     _acquire_single_instance()
     logger.info("Starting Polymarket BTC 5-Min Bot" + (" [DRY RUN]" if config.DRY_RUN else " [LIVE]"))
     database.init_db()
     polymarket.cancel_all_open_orders()
     price_feed.start_price_sampler()
+    price_feed.start_binance_ws()
     arb_monitor.start_arb_monitor()
     arb_websocket.start_arb_websocket()
 
@@ -312,33 +317,45 @@ def run_bot() -> None:
     logger.info("Buffer ready.")
 
     last_day = datetime.now(_PACIFIC).date()
+    today = last_day
     last_signal = "SKIP"
     daily_trades = 0
+    last_mgmt_ts = 0.0   # tracks when we last ran heavy management ops
+    open_positions: list[dict] = []
+    daily_pnl = 0.0
+    hourly_trend: str | None = None
 
     while True:
         loop_start = time.time()
 
         try:
-            today = datetime.now(_PACIFIC).date()
-            if today != last_day:
-                logger.info("New day — writing summary and resetting counters.")
-                _write_daily_summary()
-                risk.reset_daily_counters()
-                daily_trades = 0
-                last_day = today
+            now = loop_start
+            run_mgmt = (now - last_mgmt_ts) >= _MGMT_POLL_SECONDS
 
-            btc_price, _ = price_feed.get_btc_data()
-            hourly_trend = price_feed.get_hourly_trend()
+            if run_mgmt:
+                today = datetime.now(_PACIFIC).date()  # refresh for weekend check
+                if today != last_day:
+                    logger.info("New day — writing summary and resetting counters.")
+                    _write_daily_summary()
+                    risk.reset_daily_counters()
+                    daily_trades = 0
+                    last_day = today
 
-            # Check resolutions for any open positions
-            open_positions = database.get_open_positions()
-            _check_resolutions(open_positions)
+                hourly_trend = price_feed.get_hourly_trend()
 
-            # Retroactively fix any positions still showing 0.5 PUSH
-            _fix_push_positions()
+                # Check resolutions for any open positions
+                open_positions = database.get_open_positions()
+                _check_resolutions(open_positions)
 
-            # Re-fetch after resolution updates
-            open_positions = database.get_open_positions()
+                # Retroactively fix any positions still showing 0.5 PUSH
+                _fix_push_positions()
+
+                # Re-fetch after resolution updates
+                open_positions = database.get_open_positions()
+                daily_pnl = database.get_daily_pnl()
+                last_mgmt_ts = now
+
+            btc_price = price_feed.get_latest_btc_price()
 
             # Signal-bot kill switch
             if config.DISABLE_SIGNAL_BOT:
@@ -490,22 +507,21 @@ def run_bot() -> None:
                                     f"edge={edge:.4f} balance=${balance:.2f}"
                                 )
 
-            open_positions = database.get_open_positions()
-            daily_pnl = database.get_daily_pnl()
-            next_poll = datetime.fromtimestamp(
-                loop_start + config.POLL_INTERVAL_SECONDS, tz=timezone.utc
-            )
-            print_status_table(
-                btc_price, open_positions, daily_pnl, next_poll,
-                last_signal, daily_trades, hourly_trend, len(_pending_orders)
-            )
-            logger.debug("Heartbeat.")
+            if run_mgmt:
+                next_poll = datetime.fromtimestamp(
+                    loop_start + _MGMT_POLL_SECONDS, tz=timezone.utc
+                )
+                print_status_table(
+                    btc_price, open_positions, daily_pnl, next_poll,
+                    last_signal, daily_trades, hourly_trend, len(_pending_orders)
+                )
+                logger.debug("Heartbeat.")
 
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
 
         elapsed = time.time() - loop_start
-        time.sleep(max(0, config.POLL_INTERVAL_SECONDS - elapsed))
+        time.sleep(max(0, _ENTRY_POLL_SECONDS - elapsed))
 
 
 def _write_daily_summary() -> None:

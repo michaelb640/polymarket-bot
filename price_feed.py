@@ -1,3 +1,4 @@
+import json
 import math
 import time
 import threading
@@ -8,11 +9,18 @@ from logger import logger
 BINANCE_PRICE_URL = "https://api.binance.us/api/v3/ticker/price?symbol=BTCUSD"
 BINANCE_KLINES_URL = "https://api.binance.us/api/v3/klines"
 _KLINES_SYMBOL = "BTCUSD"
+_BINANCE_WS_URL = "wss://stream.binance.us:9443/ws/btcusd@aggTrade"
+_WS_BACKOFF = [1, 2, 5, 10, 30, 60]
 
 # Rolling 30-sample buffer (10s interval → 5 minutes of data)
 _price_buffer: deque = deque(maxlen=30)
 _buffer_lock = threading.Lock()
 _sampler_started = False
+
+# Sub-second price from Binance WebSocket
+_ws_state: dict = {"price": None, "ts": 0.0}
+_ws_lock = threading.Lock()
+_ws_started = False
 
 _vol_cache: dict = {"volatility": 0.02, "last_updated": 0.0}
 _VOL_TTL = 300  # refresh volatility every 5 minutes
@@ -113,6 +121,73 @@ def get_hourly_trend() -> str | None:
     except Exception as e:
         logger.error(f"Hourly trend fetch failed: {e}")
         return _trend_cache["trend"]
+
+
+def _binance_ws_loop() -> None:
+    try:
+        import websocket
+    except ImportError:
+        logger.error("websocket-client not installed; Binance WS disabled — REST sampler will continue.")
+        return
+
+    attempt = 0
+    while True:
+        try:
+            logger.info(f"Binance WS: connecting to {_BINANCE_WS_URL}")
+            ws = websocket.create_connection(_BINANCE_WS_URL, timeout=10)
+            attempt = 0
+            logger.info("Binance WS: connected (sub-second BTC price active)")
+            ws.settimeout(5)
+            while True:
+                try:
+                    raw = ws.recv()
+                except Exception as e:
+                    if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+                        continue
+                    raise
+                try:
+                    ev = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("e") == "aggTrade":
+                    try:
+                        price = float(ev["p"])
+                        with _ws_lock:
+                            _ws_state["price"] = price
+                            _ws_state["ts"] = time.time()
+                    except (KeyError, ValueError, TypeError):
+                        continue
+        except Exception as e:
+            backoff = _WS_BACKOFF[min(attempt, len(_WS_BACKOFF) - 1)]
+            logger.warning(f"Binance WS disconnected: {e!r} — reconnecting in {backoff}s")
+            attempt += 1
+            time.sleep(backoff)
+
+
+def start_binance_ws() -> None:
+    """Start the Binance aggTrade WebSocket (idempotent). Provides sub-second BTC price."""
+    global _ws_started
+    if _ws_started:
+        return
+    t = threading.Thread(target=_binance_ws_loop, daemon=True, name="binance-ws")
+    t.start()
+    _ws_started = True
+    logger.info("Binance WebSocket thread started.")
+
+
+def get_latest_btc_price() -> float | None:
+    """
+    Most recent BTC price. Prefers Binance WebSocket (~100ms fresh) over the
+    10s REST sampler. Falls back to sampler if WS is stale or not yet connected.
+    """
+    now = time.time()
+    with _ws_lock:
+        ws_price = _ws_state["price"]
+        ws_ts = _ws_state["ts"]
+    if ws_price is not None and now - ws_ts < 5.0:
+        return ws_price
+    with _buffer_lock:
+        return _price_buffer[-1] if _price_buffer else None
 
 
 def get_btc_data() -> tuple[float | None, float]:
