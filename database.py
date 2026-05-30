@@ -177,12 +177,29 @@ def get_push_positions() -> list[dict]:
 
 
 def get_account_balance(starting_balance: float = 100.0) -> float:
-    """Starting balance plus all realised P&L to date."""
+    """
+    Starting balance + realised P&L from BOTH:
+      - closed positions (signal bot trades)
+      - arb_events (executed live arbs AND dry_run simulated arbs)
+    Including dry_run lets the arb sizer scale with simulated profits in
+    DRY_RUN mode; in live mode there are no dry_run rows so the sum is
+    just real P&L.
+    """
     with _connect() as conn:
-        row = conn.execute(
+        signal_row = conn.execute(
             "SELECT COALESCE(SUM(pnl), 0) as total FROM positions WHERE status='closed'"
         ).fetchone()
-    return starting_balance + (row["total"] if row else 0.0)
+        arb_pnl = 0.0
+        try:
+            arb_row = conn.execute(
+                "SELECT COALESCE(SUM(est_pnl), 0) as total FROM arb_events "
+                "WHERE event_type IN ('executed','dry_run')"
+            ).fetchone()
+            arb_pnl = float(arb_row["total"]) if arb_row else 0.0
+        except Exception:
+            pass  # arb_events table may not exist on older DBs
+    signal_pnl = float(signal_row["total"]) if signal_row else 0.0
+    return starting_balance + signal_pnl + arb_pnl
 
 
 def market_has_open_position(market_id: str) -> bool:
